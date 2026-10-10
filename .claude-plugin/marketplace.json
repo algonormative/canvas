@@ -1,0 +1,14 @@
+{
+  "name": "canvas",
+  "description": "canvas: on-demand panes and media curation for Claude Code",
+  "owner": {
+    "name": "algonormative"
+  },
+  "plugins": [
+    {
+      "name": "canvas",
+      "source": "./mod",
+      "description": "Panes Claude opens on demand, and a media-curation panel for any set of files"
+    }
+  ]
+}
