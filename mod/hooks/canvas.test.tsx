@@ -73,7 +73,7 @@ function world(on: On, init: { files?: Record<string, string>; exec?: Exec; plac
     value: [...w.open].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
   }))
   on('fs.read', (_$, e) => {
-    if (e.as === 'bytes') return { value: { base64: '' } } // the render probe's assets
+    if (e.as === 'bytes') return { value: { base64: '' } }
     const body = w.files[e.path]
     return body === undefined ? { deny: 'ENOENT' } : { value: body }
   })
@@ -181,7 +181,6 @@ test('bad input is a clear tool error and opens nothing', async ($, on) => {
     ['no id', { panels: [md] }, /id: expected 1-57/],
     ['id with a space', { id: 'a b', panels: [md] }, /id: expected/],
     ['id too long', { id: 'x'.repeat(58), panels: [md] }, /id: expected/],
-    ['reserved id', { id: 'probe', panels: [md] }, /"probe" is reserved/],
     ['no panels', { id: 'a' }, /panels: expected an array/],
     ['empty panels', { id: 'a', panels: [] }, /panels: must not be empty/],
     ['unknown kind', { id: 'a', panels: [{ kind: 'chart' }] }, /panels\[0\]\.kind: expected markdown/],

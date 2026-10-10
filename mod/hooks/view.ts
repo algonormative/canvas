@@ -16,8 +16,6 @@ export const PANE_PREFIX = 'canvas-'
 export const MAX_ID = 64 - PANE_PREFIX.length
 export const MIN_REFRESH_SECONDS = 5
 export const MAX_REFRESH_SECONDS = 86_400
-/** The id of the C1 render probe's pane (`canvas-probe`): not available to `show`. */
-export const RESERVED_IDS: readonly string[] = ['probe']
 
 const ID_RE = /^[A-Za-z0-9_-]+$/
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
@@ -221,7 +219,6 @@ export function parseShow(input: unknown): Result<ParsedShow> {
     return fail(`id: expected 1-${MAX_ID} letters, digits, "_" or "-"`)
   }
   const id = input.id
-  if (RESERVED_IDS.includes(id)) return fail(`id: "${id}" is reserved, pick another`)
 
   let title = id
   if (input.title !== undefined && input.title !== null) {

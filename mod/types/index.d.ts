@@ -1,8 +1,6 @@
 // The canvas mod's contract: the shapes it keeps in $.state and the input of
 // its one model tool. Imported by the hooks modules; declares nothing on $.
 
-export type ProbePage = 'image' | 'size' | 'interactive'
-
 /** One tile of a stats panel. */
 export type StatItem = { label: string; value: string }
 
@@ -124,8 +122,6 @@ export type CurateInput = {
 declare module 'claude-code' {
   interface PluginState {
     canvas: {
-      probePage: ProbePage
-      probeSize: number
       /** One member per open `show` pane, keyed by its id; `null` once the pane is gone. */
       panes: StateFamily<PaneRecord | null>
       /** Ids of the open `show` panes, oldest first: the index the family cannot give. */

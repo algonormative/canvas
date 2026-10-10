@@ -12,7 +12,6 @@ import {
   PANE_PREFIX,
   MAX_ID,
   MAX_VIEW_CHARS,
-  RESERVED_IDS,
   applyPatches,
   cleanText,
   looksLikeSvg,
@@ -503,8 +502,7 @@ export function registerCanvas(on: On, options: PluginOptions): void {
   config = { commandsFile: typeof file === 'string' && file.trim() !== '' ? file.trim() : DEFAULT_COMMANDS_FILE }
   const cfg = config
 
-  // The probe hooks session.start unmatched and a module may do that once, so this
-  // matcher names every session: interactive or not.
+  // Every session, interactive or not.
   on('session.start', { isInteractive: [true, false] }, async ($, e, next) => {
     await startCanvas($)
     return next(e)
@@ -613,7 +611,6 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
     const record = await getRecord($, id) // reading while drawing subscribes the pane to its record
     if (!record) {
-      if (RESERVED_IDS.includes(id)) return next(e) // the render probe draws this one
       return <Box><Text dimColor>This pane has no content any more. Close it with /canvas close {id}.</Text></Box>
     }
 
