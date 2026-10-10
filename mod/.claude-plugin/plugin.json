@@ -5,5 +5,13 @@
   "author": {
     "name": "algonormative"
   },
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "commandsFile": {
+      "type": "string",
+      "title": "Command allowlist file",
+      "description": "JSON file mapping command names to { argv, cwd? }. Canvas buttons and refresh run a command only by a name listed here; a missing file allows nothing.",
+      "default": "~/.config/canvas/commands.json"
+    }
+  }
 }
