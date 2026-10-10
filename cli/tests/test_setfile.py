@@ -104,6 +104,97 @@ def test_url_inputs_become_url_items(samples, tmp_path):
     assert setfile.validate_set(data) == []
 
 
+def labels_of(*targets):
+    return [item["label"] for item in setfile.build_set("T", "pick-one", list(targets))["items"]]
+
+
+def test_two_files_with_the_same_stem_in_different_folders_are_told_apart_by_their_folder(tmp_path, capsys):
+    # the live finding: both were labelled "render", so the pane and the hand-off could not tell them apart
+    first = tmp_path / "breach-tarot-2026-10-08-vii-chariot" / "render.png"
+    second = tmp_path / "phase-garden-2026-10-05-cathedral-c004" / "render.png"
+    for f in (first, second):
+        f.parent.mkdir()
+        f.write_bytes(b"x")
+    out = tmp_path / "c.curate.json"
+    assert new(["--title", "T", "--mode", "pick-one", "-o", str(out), str(first), str(second)]) == 0
+    data = json.loads(out.read_text())
+    assert [i["label"] for i in data["items"]] == [
+        "breach-tarot-2026-10-08-vii-chariot/render",
+        "phase-garden-2026-10-05-cathedral-c004/render",
+    ]
+    assert setfile.validate_set(data) == []
+
+
+def test_a_three_way_collision_goes_up_as_many_folders_as_it_takes(tmp_path):
+    # x/render twice: one folder is not enough, so the whole group takes two
+    labels = labels_of("/r/a/x/render.png", "/r/b/x/render.png", "/r/c/y/render.png")
+    assert labels == ["a/x/render", "b/x/render", "c/y/render"]
+
+
+def test_the_shortest_run_that_works_is_used_and_short_paths_use_what_they_have():
+    assert labels_of("/m/n/render.png", "/o/p/render.png") == ["n/render", "p/render"]
+    assert labels_of("/x/render.png", "/a/x/render.png") == ["x/render", "a/x/render"]
+
+
+def test_a_stem_that_is_not_shared_stays_plain():
+    labels = labels_of("/r/a/render.png", "/r/b/render.png", "/r/c/snare.png")
+    assert labels == ["a/render", "b/render", "snare"]
+
+
+def test_nothing_changes_when_no_stem_repeats():
+    assert labels_of("/r/a/kick.wav", "/r/b/snare.wav") == ["kick", "snare"]
+
+
+def test_url_items_use_their_host_and_path_segments():
+    labels = labels_of("https://a.example/x/1/img.png", "https://b.example/x/1/img.png", "https://a.example/other.png")
+    assert labels == ["a.example/x/1/img.png", "b.example/x/1/img.png", "other.png"]
+    assert labels_of("https://a.example/x/img.png", "https://a.example/y/img.png") == ["x/img.png", "y/img.png"]
+
+
+def test_a_url_and_a_file_with_the_same_name_are_told_apart():
+    assert labels_of("/r/a/img.png", "https://h.example/img") == ["a/img", "h.example/img"]
+    # a URL label keeps its extension, a file label does not: these two never collided
+    assert labels_of("/r/a/img.png", "https://h.example/img.png") == ["img", "img.png"]
+
+
+def test_the_same_stem_in_one_folder_is_numbered_when_folders_cannot_help():
+    # render.png / render.jpg / render.webp: different paths, identical folders
+    assert labels_of("/d/render.png", "/d/render.jpg", "/d/render.webp") == ["render", "render (2)", "render (3)"]
+
+
+def test_folders_and_numbers_combine_and_numbering_skips_a_label_already_in_the_set():
+    assert labels_of("/a/x/render.png", "/a/x/render.jpg", "/b/x/render.png") == ["a/x/render", "a/x/render (2)", "b/x/render"]
+    assert labels_of("/d/render.png", "/d/render (2).png", "/d/render.jpg") == ["render", "render (2)", "render (3)"]
+    assert labels_of("/d/render.png", "/d/render.jpg", "/d/render (2).png") == ["render", "render (3)", "render (2)"]
+
+
+def test_long_folder_names_are_cut_from_the_left_to_fit_eighty_characters():
+    long_a, long_b = "a" * 120 + "-alpha", "b" * 120 + "-beta"
+    labels = labels_of(f"/r/{long_a}/render.png", f"/r/{long_b}/render.png", "/r/short/snare.png")
+    for label in labels[:2]:
+        assert len(label) <= setfile.LABEL_LIMIT and label.startswith("\u2026/") and label.endswith("/render")
+    assert labels[0].endswith("-alpha/render") and labels[1].endswith("-beta/render") and labels[0] != labels[1]
+    assert labels[2] == "snare"
+    # numbered duplicates stay inside the limit too
+    numbered = labels_of(f"/r/{long_a}/render.png", f"/r/{long_a}/render.jpg", f"/q/{long_a}/render.png")
+    assert all(len(label) <= setfile.LABEL_LIMIT for label in numbered) and len(set(numbered)) == 3
+
+
+def test_labels_are_always_unique_whatever_the_layout():
+    import itertools
+    import random
+
+    rng = random.Random(7)
+    names, stems, exts = ["a", "b", "x"], ["render", "r"], [".png", ".jpg"]
+    for _ in range(300):
+        pool = ["/" + "/".join(parents) + "/" + stem + ext
+                for parents in itertools.chain.from_iterable(itertools.product(names, repeat=n) for n in (1, 2, 3))
+                for stem in stems for ext in exts]
+        paths = rng.sample(pool, rng.randint(2, 12))
+        labels = labels_of(*paths)
+        assert len(set(labels)) == len(labels), (paths, labels)
+
+
 def test_literal_takes_the_paths_as_given_and_never_expands_a_glob(samples, tmp_path, capsys):
     out = tmp_path / "lit.json"
     star = str(samples / "kick-*.wav")

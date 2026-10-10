@@ -118,11 +118,78 @@ def _label_for(target: str) -> str:
     return os.path.splitext(os.path.basename(target))[0] or os.path.basename(target)
 
 
+def _parents_of(target: str) -> list[str]:
+    """The names above an item's label, outermost first: directories for a path, host and segments for a URL."""
+    if is_url(target):
+        parts = target.split("://", 1)[1].rstrip("/").split("/")
+    else:
+        parts = [p for p in target.split(os.sep) if p]
+    return parts[:-1]
+
+
+def _fit(prefix: str, base: str, suffix: str = "") -> str:
+    """``prefix/base`` plus ``suffix``, at most LABEL_LIMIT characters: a long prefix is cut from its left, behind "…/"."""
+    tail = base + suffix
+    if not prefix:
+        return tail
+    full = f"{prefix}/{tail}"
+    if len(full) <= LABEL_LIMIT:
+        return full
+    room = LABEL_LIMIT - 3 - len(tail)  # "…/" before the kept prefix, "/" after it
+    kept = prefix[-room:].lstrip("/") if room > 0 else ""
+    if kept:
+        return f"\u2026/{kept}/{tail}"
+    return "\u2026/" + tail[-(LABEL_LIMIT - 2) :]
+
+
+def unique_labels(targets: list[str]) -> list[str]:
+    """A label per target: the plain stem, unless two or more targets share it.
+
+    Targets that share a stem each get the shortest run of parent names that tells them apart
+    (``a-2026/render`` and ``b-2026/render``), one run length for the whole group. Where parents run out
+    first (``x/render.png`` and ``x/render.jpg``), the later ones are numbered: ``render``, ``render (2)``.
+    """
+    stems = [_label_for(t) for t in targets]
+    groups: dict[str, list[int]] = {}
+    for index, stem in enumerate(stems):
+        groups.setdefault(stem, []).append(index)
+    prefixes = [""] * len(targets)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        parents = [_parents_of(targets[i]) for i in members]
+        deepest = max(len(p) for p in parents)
+
+        def runs(depth: int, parents=parents) -> list[str]:
+            return ["/".join(p[-depth:]) if depth else "" for p in parents]
+
+        def distinct(depth: int, members=members, runs=runs) -> int:
+            return len({_fit(run, stems[i]) for run, i in zip(runs(depth), members)})
+
+        best = distinct(deepest)
+        depth = next((d for d in range(1, deepest + 1) if distinct(d) == best), 0) if best > 1 else 0
+        for i, run in zip(members, runs(depth)):
+            prefixes[i] = run
+    labels = [_fit(prefix, stem) for prefix, stem in zip(prefixes, stems)]
+    reserved = set(labels)
+    seen: set[str] = set()
+    unique = []
+    for i, label in enumerate(labels):
+        if label in seen:
+            n = 2
+            while (label := _fit(prefixes[i], stems[i], f" ({n})")) in reserved or label in seen:
+                n += 1
+        seen.add(label)
+        unique.append(label)
+    return unique
+
+
 def build_set(title: str, mode: str, targets: list[str], created_by: str | None = None) -> dict:
     """A fresh set. Item ids are a short hash of the absolute path (lengthened on collision)."""
     items = []
     used: set[str] = set()
-    for target in targets:
+    labels = unique_labels(targets)
+    for target, label in zip(targets, labels):
         length = ID_LENGTH
         item_id = _short_hash(target, length)
         while item_id in used:
@@ -131,7 +198,7 @@ def build_set(title: str, mode: str, targets: list[str], created_by: str | None 
         used.add(item_id)
         item: dict = {"id": item_id}
         item["url" if is_url(target) else "path"] = target
-        item.update(label=_label_for(target), verdict=None, rating=None, note=None)
+        item.update(label=label, verdict=None, rating=None, note=None)
         items.append(item)
     return {
         "version": VERSION,
