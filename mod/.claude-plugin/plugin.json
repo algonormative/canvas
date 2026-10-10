@@ -1,0 +1,9 @@
+{
+  "name": "canvas",
+  "version": "0.1.0",
+  "description": "Persistent panes Claude opens on demand, and a media-curation panel for any set of files",
+  "author": {
+    "name": "algonormative"
+  },
+  "types": "./types/index.d.ts"
+}
