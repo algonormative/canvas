@@ -38,6 +38,78 @@ export type ShowInput = {
   refresh?: { everySeconds: number; run: string }
 }
 
+// ---- media curation ------------------------------------------------------------
+
+export type MediaMode = 'pick-one' | 'pick-many' | 'triage' | 'rate'
+export type Verdict = 'keep' | 'toss' | 'maybe' | 'pick'
+
+/** One item of a set file as the mod keeps it. `where` is the absolute path, or the URL of a link item. */
+export type SetItem = {
+  id: string
+  where: string
+  isUrl: boolean
+  label: string
+  verdict: Verdict | null
+  rating: number | null
+}
+
+/** A set file's content, reduced to what the panel draws (notes and other fields stay in the file). */
+export type SetData = {
+  title: string
+  mode: MediaMode
+  items: SetItem[]
+  done: boolean
+  /** True once the set carries a `handoff` stamp: Claude has been told. */
+  isHandedOff: boolean
+}
+
+/**
+ * An open set. `path` is the canonical (realpath) set file; the verdicts come from reading
+ * the file, never from a press, so a redraw shows what is on disk.
+ */
+export type SetRecord = {
+  path: string
+  data: SetData
+  /** The file's mtime when `data` was read: a render that finds another one reloads. */
+  mtimeMs: number
+  /** True while the file on disk no longer parses and `data` is the last good copy. */
+  isStale: boolean
+  cursor: number
+  isFocus: boolean
+  /** Id of the item whose clip plays, or null. */
+  playing: string | null
+  /** What previews taught about an item (its kind, its clip), for `p` and `o`, keyed by item id. */
+  learned: Record<string, { kind: string; clip: string | null }>
+}
+
+/** What `canvas-preview --json` said about one file, reduced to what is drawn. */
+export type PreviewData = {
+  kind: string
+  mime: string
+  label: string
+  /** Numeric and dimension fields only; anything else is dropped on the way in. */
+  meta: Record<string, number>
+  svg: string | null
+  clip: string | null
+  markdown: string | null
+  tier: 'rich' | 'reduced' | 'card'
+  reason: string | null
+}
+
+/** `preview` is null when canvas-preview could not be run or answered nonsense. */
+export type PreviewEntry = { preview: PreviewData | null }
+
+/** A hand-off that could not reach the prompt box and rides the next prompt as context. */
+export type PendingHandoff = { set: string; text: string }
+
+/** The model-facing input of `curate`: a set file, or the items to make one from. */
+export type CurateInput = {
+  set?: string
+  items?: string[]
+  title?: string
+  mode?: MediaMode
+}
+
 declare module 'claude-code' {
   interface PluginState {
     canvas: {
@@ -47,10 +119,21 @@ declare module 'claude-code' {
       panes: StateFamily<PaneRecord | null>
       /** Ids of the open `show` panes, oldest first: the index the family cannot give. */
       paneIds: string[]
+      /** One member per open set, keyed by a short key of its canonical path; `null` once closed. */
+      sets: StateFamily<SetRecord | null>
+      /** Keys of the open curate panes, oldest first. */
+      curateKeys: string[]
+      /** Preview results keyed `<set key>|<item id>|<budget>`; `null` once evicted. */
+      previews: StateFamily<PreviewEntry | null>
+      /** Preview keys with their weight in characters, oldest first: what evicts the oldest. */
+      previewIndex: { id: string; size: number }[]
+      /** Hand-offs waiting for the next prompt to ride along. */
+      pending: PendingHandoff[]
     }
   }
 
   interface McpToolInputs {
     mcp__canvas__show: ShowInput
+    mcp__canvas__curate: CurateInput
   }
 }

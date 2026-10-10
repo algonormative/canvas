@@ -1,7 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { ActionButton, PaneRecord, Panel, View } from '../types'
+import type { ActionButton, PaneRecord, PendingHandoff, Panel, View } from '../types'
+import { cli, clearPlaying, openSetFile, putSet, stopSet } from './curate'
+import type { Host } from './curate'
+import { PX_PER_COLUMN, SVG_ELEMENT_MAX, SVG_PAGE_BUDGET } from './layout'
+import { renderMediaPanel } from './media'
+import type { Kit } from './media'
+import { MAX_PATH, inlineSetName, keyOf, parseCurate } from './setmodel'
 import {
   PANE_PREFIX,
   MAX_ID,
@@ -22,25 +28,26 @@ import type { CommandEntry } from './view'
 // nothing here calls a model, and a command only ever runs by NAME through the
 // allowlist file, whose contents the model can neither read nor change.
 
-/**
- * Characters of Svg source one pane draws in all; the single constant C1's probe
- * tunes. Probe 2026-10-10: ~260k characters of Svg in one desktop pane drew fine.
- */
-export const SVG_PAGE_BUDGET = 240_000
-/** One Svg over 131,072 characters is refused and takes the pane down with it; probe-measured cap below that. */
-const SVG_ELEMENT_MAX = 120_000
-/** Pixels per terminal column when a pane's width is turned into an Svg width (probe: ~8). */
-const PX_PER_COLUMN = 8
+export { SVG_PAGE_BUDGET } from './layout'
 /** `$.fs.read` refuses a larger file, so a bigger one is too large before it is read. */
 const SVG_FILE_MAX_BYTES = 4 * 1024 * 1024
 
 const TOOL = 'mcp__canvas__show'
+const CURATE_TOOL = 'mcp__canvas__curate'
+/** A curate pane's id is this plus the set's key. */
+const CURATE_PREFIX = 'curate-'
 const DEFAULT_COMMANDS_FILE = '~/.config/canvas/commands.json'
 const PRESS_TIMEOUT_MS = 120_000
 const REFRESH_TIMEOUT_MS = 60_000
 
 const paneIds = atom({ plugin: 'canvas', key: 'paneIds' } as const, [] as string[])
 const panes = { plugin: 'canvas', key: 'panes' } as const
+// Media curation: one record per open set, one entry per preview, and the hand-offs waiting for a prompt.
+const sets = { plugin: 'canvas', key: 'sets' } as const
+const curateKeys = atom({ plugin: 'canvas', key: 'curateKeys' } as const, [] as string[])
+const previews = { plugin: 'canvas', key: 'previews' } as const
+const previewIndex = atom({ plugin: 'canvas', key: 'previewIndex' } as const, [] as { id: string; size: number }[])
+const pending = atom({ plugin: 'canvas', key: 'pending' } as const, [] as PendingHandoff[])
 
 // Module variables hold only what dies with the module anyway: timers and
 // in-flight guards. A hot reload drops them; session.start re-arms from $.state.
@@ -90,7 +97,7 @@ const INPUT_SCHEMA = {
           source: { type: 'string', description: 'svg: the <svg> markup (give source or path, not both).' },
           path: { type: 'string', description: 'svg: absolute path of an .svg file, read each time the pane draws.' },
           alt: { type: 'string', description: 'svg: what the picture shows; this is all a terminal draws.' },
-          set: { type: 'string', description: 'media: absolute path of a *.curate.json set (arrives with curate).' },
+          set: { type: 'string', description: 'media: absolute path of a *.curate.json set; the panel curates it in place (keys j k y n m 1-5 p o f d).' },
           buttons: {
             type: 'array',
             description: 'actions: buttons. Give each exactly one of run or prompt.',
@@ -131,6 +138,36 @@ const DESCRIPTION =
   'or put text in the user\'s draft box with "prompt" - nothing is sent for them. "refresh" re-runs an allowlisted command every few seconds and patches ' +
   "panels from the JSON it prints. The user closes a pane with /canvas close <id>."
 
+const CURATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    set: {
+      type: 'string',
+      maxLength: MAX_PATH,
+      description: 'Absolute path of an existing *.curate.json set file (made with canvas-set new). Give this or items, not both.',
+    },
+    items: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 500,
+      items: { type: 'string', maxLength: MAX_PATH },
+      description: 'Absolute paths of the files to curate (or http(s) URLs, which show as link cards). A set file is written under ~/.cache/canvas/sets for them.',
+    },
+    title: { type: 'string', maxLength: 100, description: 'items: the set\'s title. Default "Curate".' },
+    mode: {
+      type: 'string',
+      enum: ['pick-one', 'pick-many', 'triage', 'rate'],
+      description: 'items: how the user decides. pick-one (one winner, sent as soon as they pick), pick-many, triage (keep / maybe / toss; the default), rate (1-5). Everything but pick-one is sent when they press Done.',
+    },
+  },
+}
+
+const CURATE_DESCRIPTION =
+  'Open a set of media (audio, images, video, SVG, PDFs, text) in a pane for the user to curate: each item has a preview that fits the pane, ' +
+  'and they keep, toss, maybe, pick or rate them with keys or buttons. Give "set" (an existing *.curate.json) or "items" with "title" and "mode". ' +
+  'Returns at once with the number of items and does not echo them; the result arrives later as a prompt from the user when they finish ' +
+  '(for pick-one, the moment they pick; otherwise when they press Done). Do not wait or poll, and do not call it again for a set that is already open: it only refocuses the pane.'
+
 const short = (label: string): string => (label.length > 40 ? `${label.slice(0, 39)}…` : label)
 
 // ---- state -----------------------------------------------------------------
@@ -142,6 +179,8 @@ async function getRecord($: Dollar, id: string): Promise<PaneRecord | null> {
 /** Drops a pane's record, id and timer. Idempotent: a person's close and /canvas close can both land. */
 async function forget($: Dollar, id: string): Promise<void> {
   disarm(id)
+  // A clip a media panel of this pane is playing stops with the pane.
+  for (const panel of (await getRecord($, id))?.view.panels ?? []) if (panel.kind === 'media') stopSet(keyOf(panel.set))
   await update($, paneIds, ids => ids.filter(one => one !== id))
   await update($, { ...panes, id }, () => null)
 }
@@ -306,6 +345,117 @@ async function loadSvg($: Dollar, panel: Extract<Panel, { kind: 'svg' }>): Promi
 
 const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
 
+// ---- media curation -----------------------------------------------------------------
+
+/**
+ * What the curate code (curate.ts, media.tsx) may do, as closures over this file's `$`: the
+ * engine follows `$` only inside the file whose hook holds it, so the code that needs it takes this.
+ */
+function mediaHost($: Dollar): Host {
+  return {
+    getSet: async key => (await read($, { ...sets, id: key })) ?? null,
+    updateSet: async (key, fn) => {
+      await update($, { ...sets, id: key }, cur => fn(cur ?? null))
+    },
+    getPreview: async id => (await read($, { ...previews, id })) ?? null,
+    setPreview: async (id, entry) => {
+      await update($, { ...previews, id }, () => entry)
+    },
+    updatePreviewIndex: async fn => {
+      await update($, previewIndex, fn)
+    },
+    updatePending: async fn => {
+      await update($, pending, fn)
+    },
+    home: async () => (await $.env.get('HOME')) || undefined,
+    run: async (argv, timeoutMs) => {
+      const out = await $.process.run(argv, { timeoutMs })
+      return { exitCode: out.exitCode, stdout: out.stdout, stderr: out.stderr }
+    },
+    stat: async path => {
+      const found = await $.fs.stat(path, { resolve: true })
+      return { mtimeMs: found.mtimeMs, realPath: found.realPath }
+    },
+    readText: async path => {
+      const body = await $.fs.read(path)
+      return typeof body === 'string' ? body : ''
+    },
+    readBase64: async path => (await $.fs.read(path, { as: 'bytes' })).base64,
+    play: (base64, signal) => $.audio.play({ base64, mime: 'audio/mpeg' }, { signal }),
+    later: (ms, fn) => {
+      $.clock.after(ms, fn)
+    },
+    toast: text => $.ui.toast(text),
+    debug: text => $.ui.log(`canvas: ${text}`, { to: 'debug' }),
+    promptText: async () => (await $.prompt.read()).text,
+    submit: async text => {
+      // A prompt another plugin dropped never reached the model: that is a failure, not a send.
+      const sent = await $.prompt.submit({ text })
+      if (sent.drop !== undefined) throw new Error(sent.drop)
+    },
+    fill: async text => (await $.prompt.fill({ text, mode: 'append' })).isFilled,
+  }
+}
+
+const oneLineError = (text: string): string => cleanText(text.split('\n').find(line => line.trim() !== '') ?? 'failed').slice(0, 300)
+
+/** The `curate` tool: take (or write) the set, open its pane, and return at once. */
+async function curateCall($: Dollar, input: unknown): Promise<{ result: string } | { deny: string }> {
+  const parsed = parseCurate(input)
+  if (!parsed.ok) return { deny: `canvas curate: ${parsed.error}` }
+  const host = mediaHost($)
+  const request = parsed.value
+
+  let setPath: string
+  let isNew = false
+  if (request.kind === 'set') {
+    setPath = request.set
+  } else {
+    const home = await host.home()
+    if (!home) return { deny: 'canvas curate: HOME is not set, so there is nowhere to write the set file' }
+    setPath = `${home.replace(/\/$/, '')}/.cache/canvas/sets/${inlineSetName(request.title, await $.clock.now())}`
+    try {
+      // `--title=` keeps a title that starts with a dash from being read as an option; `--` does the same for the items.
+      const made = await cli(host, 'canvas-set', ['new', `--title=${request.title}`, `--mode=${request.mode}`, '-o', setPath, '--', ...request.items])
+      if (made.exitCode !== 0) return { deny: `canvas curate: ${oneLineError(made.stderr)}` }
+    } catch {
+      return { deny: 'canvas curate: canvas-set could not be run (is it on the PATH?)' }
+    }
+    isNew = true
+  }
+
+  const opened = await openSetFile(host, setPath)
+  if (!opened.ok) return { deny: `canvas curate: ${opened.error}` }
+  const { title, items } = opened.record.data
+  const key = keyOf(opened.record.path)
+  const paneId = CURATE_PREFIX + key
+  let isOpen = false
+  try {
+    isOpen = (await read($, curateKeys)).includes(key) && (await $.ui.panes()).some(pane => pane.id === paneId)
+  } catch {
+    isOpen = false
+  }
+
+  await putSet(host, key, opened.record)
+  await update($, curateKeys, keys => (keys.includes(key) ? keys : [...keys, key]))
+
+  let drawn = ''
+  try {
+    // focus: a pane opened without it never gets the hotkeys.
+    const placed = await $.ui.open({ id: paneId, title, focus: true })
+    if (!placed.isPlaced) drawn = ` The pane is not drawn yet (${placed.reason}).`
+  } catch {
+    if (!isOpen) await update($, curateKeys, keys => keys.filter(one => one !== key))
+    return { deny: 'canvas curate: the pane could not be opened' }
+  }
+  const count = `${items.length} ${items.length === 1 ? 'item' : 'items'}`
+  const head = isOpen
+    ? `Focused ${title} (${count}), already open in a pane`
+    : `Opened ${title} (${count}) in a pane`
+  const where = isNew ? ` Set file: ${opened.record.path}.` : ''
+  return { result: `${head}; the result arrives as a later prompt when Nick finishes.${where}${drawn}` }
+}
+
 // ---- hooks ---------------------------------------------------------------------
 
 // Written by registerCanvas: the options are fixed for one load of the module.
@@ -319,6 +469,11 @@ async function startCanvas($: Dollar): Promise<void> {
     $.ui.log('canvas: the show tool could not be registered', { to: 'debug' })
   }
   try {
+    await $.tool.register({ name: 'curate', description: CURATE_DESCRIPTION, inputSchema: CURATE_SCHEMA })
+  } catch {
+    $.ui.log('canvas: the curate tool could not be registered', { to: 'debug' })
+  }
+  try {
     await $.command.register({
       name: 'canvas',
       description: 'List the canvas panes, or close one',
@@ -328,7 +483,11 @@ async function startCanvas($: Dollar): Promise<void> {
     $.ui.log('canvas: the /canvas command could not be registered', { to: 'debug' })
   }
   // A reload dropped every timer of the old environment: the panes kept in $.state arm again.
-  for (const record of await openRecords($)) arm($, config, record.view)
+  const records = await openRecords($)
+  for (const record of records) arm($, config, record.view)
+  // ... and the clip that was playing, so no set is left saying it still is.
+  const mediaKeys = records.flatMap(({ view }) => view.panels.flatMap(p => (p.kind === 'media' ? [keyOf(p.set)] : [])))
+  await clearPlaying(mediaHost($), [...(await read($, curateKeys)), ...mediaKeys])
 }
 
 /** Hooks the pane tool, its command and its drawing. */
@@ -348,6 +507,15 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     const parsed = parseShow(e)
     if (!parsed.ok) return { deny: `canvas show: ${parsed.error}` }
     const { view, notes } = parsed.value
+
+    // A media panel's set is opened (validated, read) now, so the pane draws it at once.
+    const host = mediaHost($)
+    for (const [i, panel] of view.panels.entries()) {
+      if (panel.kind !== 'media') continue
+      const opened = await openSetFile(host, panel.set)
+      if (opened.ok) await putSet(host, keyOf(panel.set), opened.record)
+      else notes.push(`panels[${i}]: the set could not be opened (${opened.error}).`)
+    }
 
     const existed = (await read($, paneIds)).includes(view.id)
     const before = existed ? await getRecord($, view.id) : null
@@ -381,6 +549,47 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     return { text: 'Usage: /canvas to list the panes, /canvas close <id> to close one.' }
   }).catch(() => ({ text: 'canvas: that failed, try again.' }))
 
+  on('tool.call', { tool: CURATE_TOOL }, async ($, e) => curateCall($, e)).catch(() => ({
+    deny: 'canvas curate: failed unexpectedly, try again',
+  }))
+
+  // A result that could not be put in the draft box rides the next prompt the person sends.
+  on('prompt.submit', async ($, e, next) => {
+    const waiting = await read($, pending)
+    if (waiting.length === 0) return next(e)
+    const context = waiting.map(one => `Result of the curation pane (it could not be put in the prompt box when the user finished, so it rides this prompt):\n${one.text}`)
+    const out = await next({ ...e, context: [...(e.context ?? []), ...context] })
+    if (out.drop === undefined) {
+      await update($, pending, list => list.filter(one => !waiting.some(w => w.set === one.set && w.text === one.text)))
+    }
+    return out
+  }).catch(($, e, next) => next(e))
+
+  on('ui.close', { id: /^curate-/ }, async ($, e, next) => {
+    const out = await next(e)
+    if (!('deny' in out) || out.deny === undefined) {
+      const key = e.id.slice(CURATE_PREFIX.length)
+      stopSet(key)
+      await update($, curateKeys, keys => keys.filter(one => one !== key))
+    }
+    return out
+  })
+
+  on('ui.render', { component: 'Pane', requestId: /^curate-/ }, async ($, e) => {
+    const els = $.ui.resolve(e)
+    const { Box, Text, Button, Markdown } = els
+    const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : undefined
+    const kit: Kit = Svg ? { Box, Text, Button, Markdown, Svg } : { Box, Text, Button, Markdown }
+    const media = await renderMediaPanel(mediaHost($), kit, {
+      key: e.requestId.slice(CURATE_PREFIX.length),
+      index: 0,
+      hotkeys: true,
+      columns: Math.max(1, e.props.bodyColumns),
+      pageBudget: SVG_PAGE_BUDGET,
+    })
+    return media.tree
+  })
+
   // A close by the person's mark or key reaches here too; an unload does not (its state stays for the reload).
   on('ui.close', { id: /^canvas-/ }, async ($, e, next) => {
     const out = await next(e)
@@ -405,6 +614,13 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     const allowed: Allowlist = needsAllowlist ? await loadAllowlist($, cfg) : new Map()
     const paneWidth = Math.max(1, e.props.bodyColumns) * PX_PER_COLUMN
 
+    const kit: Kit = Svg ? { Box, Text, Button, Markdown, Svg } : { Box, Text, Button, Markdown }
+    const firstMedia = view.panels.findIndex(p => p.kind === 'media')
+    // A media panel's pictures arrive one by one, so its share of the page is reserved up front (equal
+    // shares, one more for the plain Svg panels if there are any): the budget it asks previews for then
+    // never changes as they load, and a sibling's previews never cost this panel a refetch.
+    const mediaCount = view.panels.filter(p => p.kind === 'media').length
+    const mediaShare = Math.floor(SVG_PAGE_BUDGET / Math.max(1, mediaCount + (view.panels.some(p => p.kind === 'svg') ? 1 : 0)))
     let svgUsed = 0
     const body: JSX.Element[] = []
     for (const [i, panel] of view.panels.entries()) {
@@ -450,9 +666,20 @@ export function registerCanvas(on: On, options: PluginOptions): void {
           }
           break
         }
-        case 'media':
-          body.push(<Text dimColor>media panel: arrives with curate (vault-2lzfb)</Text>)
+        case 'media': {
+          const pageBudget = Math.min(mediaShare, Math.max(0, SVG_PAGE_BUDGET - svgUsed))
+          const media = await renderMediaPanel(mediaHost($), kit, {
+            key: keyOf(panel.set),
+            index: i,
+            hotkeys: i === firstMedia,
+            columns: Math.max(1, e.props.bodyColumns),
+            pageBudget,
+            reopen: panel.set,
+          })
+          svgUsed += pageBudget
+          body.push(media.tree)
           break
+        }
         case 'actions':
           body.push(
             <Box flexDirection="row" flexWrap="wrap" gap={1}>

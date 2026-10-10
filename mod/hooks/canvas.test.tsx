@@ -229,7 +229,6 @@ test('stats, table and markdown draw on both surfaces', async ($, on) => {
     panels: [
       { kind: 'stats', items: [{ label: 'Pens', value: '3' }, { label: 'Travel', value: '41 m' }] },
       { kind: 'table', columns: ['Card', 'Time', 'Check'], rows: [['0 Fool', '6:10', 'a | b'], ['1 Mage', 7, true]] },
-      { kind: 'media', set: '/abs/kicks.curate.json' },
     ],
   })
   for (const surface of SURFACES) {
@@ -240,7 +239,6 @@ test('stats, table and markdown draw on both surfaces', async ($, on) => {
     expect(table?.props.text).toBe(
       ['| Card | Time | Check |', '| --- | --- | --- |', '| 0 Fool | 6:10 | a \\| b |', '| 1 Mage | 7 | true |'].join('\n'),
     )
-    expect(await ui.find({ type: 'Text', text: 'media panel: arrives with curate (vault-2lzfb)' })).toBeDefined()
   }
 })
 
@@ -545,7 +543,7 @@ test('panes live in $.state: a restart of the session re-arms their refresh once
   // `gone` was closed in the meantime by something this module never heard of.
   w.open.delete('canvas-gone')
   await $.session.start(START)
-  expect(w.tools.map(t => t.name)).toEqual(['show', 'show'])
+  expect(w.tools.map(t => t.name)).toEqual(['show', 'curate', 'show', 'curate'])
 
   for (const surface of SURFACES) {
     const ui = await draw($, surface, 'live')
