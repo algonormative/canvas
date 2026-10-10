@@ -1,0 +1,23 @@
+[project]
+name = "canvas-cli"
+version = "0.1.0"
+description = "canvas-preview and canvas-set: deterministic media previews and curation set files for the canvas mod"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.0"]
+
+[project.scripts]
+canvas-preview = "canvas_cli.preview:main"
+canvas-set = "canvas_cli.setfile:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["canvas_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
