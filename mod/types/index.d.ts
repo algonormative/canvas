@@ -78,9 +78,17 @@ export type SetRecord = {
   isFocus: boolean
   /** Id of the item whose clip plays, or null. */
   playing: string | null
-  /** What previews taught about an item (its kind, its clip), for `p` and `o`, keyed by item id. */
+  /** What previews taught about an item (its kind, its clip), for `p`, keyed by item id. `o` never trusts it. */
   learned: Record<string, { kind: string; clip: string | null }>
+  /**
+   * Set once the result went to Claude but writing the hand-off stamp into the file failed: while it is
+   * there the result is not sent again, and the stamp is retried (`retries` made so far, the digest of
+   * the summary that was sent). Absent or null otherwise (state from an older load has no field).
+   */
+  stampPending?: StampPending | null
 }
+
+export type StampPending = { via: 'submit' | 'fill'; digest: string; retries: number }
 
 /** What `canvas-preview --json` said about one file, reduced to what is drawn. */
 export type PreviewData = {
@@ -96,8 +104,11 @@ export type PreviewData = {
   reason: string | null
 }
 
-/** `preview` is null when canvas-preview could not be run or answered nonsense. */
-export type PreviewEntry = { preview: PreviewData | null }
+/**
+ * `preview` is null when canvas-preview could not be run or answered nonsense; such an entry carries `at`
+ * (the clock when it was stored) and is tried again after 30 s.
+ */
+export type PreviewEntry = { preview: PreviewData | null; at?: number }
 
 /** A hand-off that could not reach the prompt box and rides the next prompt as context. */
 export type PendingHandoff = { set: string; text: string }
@@ -123,7 +134,7 @@ declare module 'claude-code' {
       sets: StateFamily<SetRecord | null>
       /** Keys of the open curate panes, oldest first. */
       curateKeys: string[]
-      /** Preview results keyed `<set key>|<item id>|<budget>`; `null` once evicted. */
+      /** Preview results keyed `<set key>|<item id>|<budget>|<mtime:size of the file>`; `null` once evicted. */
       previews: StateFamily<PreviewEntry | null>
       /** Preview keys with their weight in characters, oldest first: what evicts the oldest. */
       previewIndex: { id: string; size: number }[]

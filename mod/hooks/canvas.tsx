@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
 import type { ActionButton, PaneRecord, PendingHandoff, Panel, View } from '../types'
-import { cli, clearPlaying, openSetFile, putSet, stopSet } from './curate'
+import { cli, clearPlaying, openSetFile, putSet, resumeStamps, setKeyOf, stopSet } from './curate'
 import type { Host } from './curate'
 import { PX_PER_COLUMN, SVG_ELEMENT_MAX, SVG_PAGE_BUDGET } from './layout'
 import { renderMediaPanel } from './media'
@@ -180,7 +180,7 @@ async function getRecord($: Dollar, id: string): Promise<PaneRecord | null> {
 async function forget($: Dollar, id: string): Promise<void> {
   disarm(id)
   // A clip a media panel of this pane is playing stops with the pane.
-  for (const panel of (await getRecord($, id))?.view.panels ?? []) if (panel.kind === 'media') stopSet(keyOf(panel.set))
+  for (const panel of (await getRecord($, id))?.view.panels ?? []) if (panel.kind === 'media') stopSet(await setKeyOf(mediaHost($), panel.set))
   await update($, paneIds, ids => ids.filter(one => one !== id))
   await update($, { ...panes, id }, () => null)
 }
@@ -374,8 +374,9 @@ function mediaHost($: Dollar): Host {
     },
     stat: async path => {
       const found = await $.fs.stat(path, { resolve: true })
-      return { mtimeMs: found.mtimeMs, realPath: found.realPath }
+      return { mtimeMs: found.mtimeMs, size: found.size, kind: found.kind, realPath: found.realPath }
     },
+    now: async () => await $.clock.now(),
     readText: async path => {
       const body = await $.fs.read(path)
       return typeof body === 'string' ? body : ''
@@ -416,7 +417,8 @@ async function curateCall($: Dollar, input: unknown): Promise<{ result: string }
     setPath = `${home.replace(/\/$/, '')}/.cache/canvas/sets/${inlineSetName(request.title, await $.clock.now())}`
     try {
       // `--title=` keeps a title that starts with a dash from being read as an option; `--` does the same for the items.
-      const made = await cli(host, 'canvas-set', ['new', `--title=${request.title}`, `--mode=${request.mode}`, '-o', setPath, '--', ...request.items])
+      // `--literal`: the items are the model's, so each is one file as given, never a glob to expand.
+      const made = await cli(host, 'canvas-set', ['new', '--literal', `--title=${request.title}`, `--mode=${request.mode}`, '-o', setPath, '--', ...request.items])
       if (made.exitCode !== 0) return { deny: `canvas curate: ${oneLineError(made.stderr)}` }
     } catch {
       return { deny: 'canvas curate: canvas-set could not be run (is it on the PATH?)' }
@@ -486,8 +488,13 @@ async function startCanvas($: Dollar): Promise<void> {
   const records = await openRecords($)
   for (const record of records) arm($, config, record.view)
   // ... and the clip that was playing, so no set is left saying it still is.
-  const mediaKeys = records.flatMap(({ view }) => view.panels.flatMap(p => (p.kind === 'media' ? [keyOf(p.set)] : [])))
-  await clearPlaying(mediaHost($), [...(await read($, curateKeys)), ...mediaKeys])
+  const host = mediaHost($)
+  const mediaKeys: string[] = []
+  for (const { view } of records) for (const panel of view.panels) if (panel.kind === 'media') mediaKeys.push(await setKeyOf(host, panel.set))
+  const setKeys = [...(await read($, curateKeys)), ...mediaKeys]
+  await clearPlaying(host, setKeys)
+  // ... and the retries of a hand-off stamp that could not be written, which died with the timers.
+  await resumeStamps(host, setKeys)
 }
 
 /** Hooks the pane tool, its command and its drawing. */
@@ -513,7 +520,8 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     for (const [i, panel] of view.panels.entries()) {
       if (panel.kind !== 'media') continue
       const opened = await openSetFile(host, panel.set)
-      if (opened.ok) await putSet(host, keyOf(panel.set), opened.record)
+      // Keyed on the real path (as curate keys it), so a link to a set and the set are one set.
+      if (opened.ok) await putSet(host, keyOf(opened.record.path), opened.record)
       else notes.push(`panels[${i}]: the set could not be opened (${opened.error}).`)
     }
 
@@ -669,7 +677,7 @@ export function registerCanvas(on: On, options: PluginOptions): void {
         case 'media': {
           const pageBudget = Math.min(mediaShare, Math.max(0, SVG_PAGE_BUDGET - svgUsed))
           const media = await renderMediaPanel(mediaHost($), kit, {
-            key: keyOf(panel.set),
+            key: await setKeyOf(mediaHost($), panel.set),
             index: i,
             hotkeys: i === firstMedia,
             columns: Math.max(1, e.props.bodyColumns),

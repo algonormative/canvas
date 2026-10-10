@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { PreviewEntry, SetItem, SetRecord, Verdict } from '../types'
-import { fetchPreviews, previewId, reloadSet, reopenSet, runAction } from './curate'
+import { fetchPreviews, isUsable, previewId, reloadSet, reopenSet, runAction, statStamp } from './curate'
 import type { Host, MediaAction, Want } from './curate'
 import {
   FOCUS_MAX_PX,
@@ -97,11 +97,15 @@ export async function renderMediaPanel(host: Host, kit: Kit, opt: MediaOptions):
   const entries = new Map<string, PreviewEntry | null>()
   const wants: Want[] = []
   if (page.budget > 0) {
+    const now = await host.now()
     for (const item of here) {
       if (item.isUrl) continue
-      const entry = await host.getPreview(previewId(opt.key, item.id, page.budget))
+      // A preview is of the file as it was: a changed mtime or size asks again, and so does a failure after a while.
+      const stamp = await statStamp(host, item.where)
+      const found = await host.getPreview(previewId(opt.key, item.id, page.budget, stamp))
+      const entry = isUsable(found, now) ? found : null
       entries.set(item.id, entry)
-      if (!entry) wants.push({ itemId: item.id, where: item.where, budget: page.budget })
+      if (!entry) wants.push({ itemId: item.id, where: item.where, budget: page.budget, stamp })
     }
   }
   if (wants.length > 0) host.later(0, () => fetchPreviews(host, opt.key, wants))
@@ -181,7 +185,9 @@ function toolbar(ctx: Ctx, item: SetItem): JSX.Element {
       <Button key={`${p}:hk:play`} label={isPlaying ? 'stop' : 'play'} {...hot('p')} onPress={() => dispatch({ t: 'play' })} />
       <Button key={`${p}:hk:open`} label="open" {...hot('o')} onPress={() => dispatch({ t: 'open' })} />
       <Button key={`${p}:hk:focus`} label={record.isFocus ? 'list' : 'focus'} {...hot('f')} onPress={() => dispatch({ t: 'focus' })} />
-      <Button key={`${p}:hk:done`} label="done" variant="primary" {...hot('d')} onPress={() => dispatch({ t: 'done' })} />
+      {record.data.mode === 'pick-one' ? null : (
+        <Button key={`${p}:hk:done`} label="done" variant="primary" {...hot('d')} onPress={() => dispatch({ t: 'done' })} />
+      )}
     </Box>
   )
 }
@@ -263,18 +269,22 @@ function picture(ctx: Ctx, item: SetItem, entry: PreviewEntry | null | undefined
   const guess = guessKind(item.where, item.isUrl)
   const fallback = (lines: string[], kind: string = guess) => card(ctx, kind, lines, full ? undefined : cols)
   if (item.isUrl) return fallback(['link', 'press o to open it'])
+  // No share of the page's pictures for this item (a pane with many panels): none is fetched, so say why.
+  if (ctx.itemBudget <= 0) return fallback(['too many panels to preview'])
   if (!entry) return fallback(['loading…'])
   const p = entry.preview
   if (!p) return fallback([reasonText(null)])
 
   if (p.svg !== null) {
     if (!Svg) return fallback([formatMeta(p.meta, full), 'pictures need the desktop app'], p.kind)
-    const playhead = p.kind === 'audio' && ctx.record.playing === item.id ? withPlayhead(p.svg, p.meta.duration) : null
-    const source = playhead ?? p.svg
-    const weight = source.length
     // Whatever the CLI sent, one Svg stays under the element cap, the item's share and what the page has left.
-    if (weight > Math.min(SVG_ELEMENT_MAX, ctx.itemBudget) || weight > ctx.svgLeft) return fallback([formatMeta(p.meta, full), reasonText('budget')], p.kind)
-    ctx.svgLeft -= weight
+    const fits = (candidate: string): boolean => candidate.length <= Math.min(SVG_ELEMENT_MAX, ctx.itemBudget) && candidate.length <= ctx.svgLeft
+    // The playing waveform carries a playhead; if that pushes it over, the plain waveform is drawn instead, never a card.
+    const swept = p.kind === 'audio' && ctx.record.playing === item.id ? withPlayhead(p.svg, p.meta.duration) : null
+    const playhead = swept !== null && fits(swept) ? swept : null
+    const source = playhead ?? p.svg
+    if (!fits(source)) return fallback([formatMeta(p.meta, full), reasonText('budget')], p.kind)
+    ctx.svgLeft -= source.length
     const alt = `${p.kind} preview of ${quoteLabel(item.label)}${playhead ? ', playing' : ''}`
     // A playhead animates (SMIL), which only the sandboxed frame of an interactive Svg runs.
     return playhead ? <Svg source={source} alt={alt} width={px} isInteractive /> : <Svg source={source} alt={alt} width={px} />

@@ -1,7 +1,8 @@
-import type { PendingHandoff, PreviewEntry, SetRecord, Verdict } from '../types'
+import type { PendingHandoff, PreviewData, PreviewEntry, SetRecord, Verdict } from '../types'
 import {
-  guessKind,
   handoffText,
+  isRunnablePath,
+  keyOf,
   oneLine,
   openArgv,
   parseMarkResult,
@@ -30,7 +31,9 @@ export type Host = {
   home(): Promise<string | undefined>
   run(argv: string[], timeoutMs: number): Promise<RunResult>
   /** `$.fs.stat` with `resolve: true`; rejects for a path that is not there. */
-  stat(path: string): Promise<{ mtimeMs: number; realPath?: string }>
+  stat(path: string): Promise<{ mtimeMs: number; size: number; kind: 'file' | 'dir' | 'other'; realPath?: string }>
+  /** The clock, in milliseconds since the epoch. */
+  now(): Promise<number>
   readText(path: string): Promise<string>
   readBase64(path: string): Promise<string>
   play(base64: string, signal: AbortSignal): Promise<void>
@@ -53,6 +56,10 @@ const PREVIEW_CACHE_CHARS = 1_500_000
 const PREVIEW_CACHE_ENTRIES = 80
 /** A spawn that fails faster than this was not found, rather than slow. */
 const SPAWN_FAILURE_MS = 2_000
+/** A preview that failed is tried again once it is this old (the next time the item is drawn). */
+export const FAILED_PREVIEW_TTL_MS = 30_000
+/** Waits before each retry of a hand-off stamp that could not be written; three retries in all. */
+const STAMP_RETRY_MS = [2_000, 6_000, 20_000] as const
 
 export type MediaAction =
   | { t: 'move'; delta: number }
@@ -72,9 +79,43 @@ let active = 0
 const reloading = new Set<string>()
 const again = new Set<string>()
 const sending = new Set<string>()
-const playing = new Map<string, { id: string; stop: AbortController }>()
+/** Sets with a mark that landed while their result was being sent. */
+const dirty = new Set<string>()
+const stamping = new Set<string>()
+/** The one clip that plays, in whichever set: starting another stops it. */
+let player: { key: string; id: string; stop: AbortController } | null = null
 
-export const previewId = (key: string, itemId: string, budget: number): string => `${key}|${itemId}|${budget}`
+/**
+ * A preview's place in the cache. `stamp` is what the file was when it was looked at (see `statStamp`), so a
+ * file that changed asks for a new preview instead of showing the old one.
+ */
+export const previewId = (key: string, itemId: string, budget: number, stamp: string): string =>
+  `${key}|${itemId}|${budget}|${stamp}`
+
+/** `<mtime>:<size>` of a file, or `missing` when it has no stat. */
+export async function statStamp(host: Host, where: string): Promise<string> {
+  try {
+    const found = await host.stat(where)
+    return `${found.mtimeMs}:${found.size}`
+  } catch {
+    return 'missing'
+  }
+}
+
+/** Whether a cached entry may be drawn now: a failure is only good for a while, a preview for as long as its file is the same. */
+export function isUsable(entry: PreviewEntry | null, now: number): entry is PreviewEntry {
+  if (!entry) return false
+  return entry.preview !== null || (entry.at !== undefined && now - entry.at < FAILED_PREVIEW_TTL_MS)
+}
+
+/** The key a set goes by in $.state: its real path, so a link to a set and the set itself are one set. */
+export async function setKeyOf(host: Host, path: string): Promise<string> {
+  try {
+    return keyOf((await host.stat(path)).realPath ?? path)
+  } catch {
+    return keyOf(path)
+  }
+}
 
 const clamp = (n: number, count: number): number => Math.min(Math.max(0, n), Math.max(0, count - 1))
 
@@ -131,18 +172,38 @@ export async function openSetFile(host: Host, rawPath: string): Promise<Opened> 
     if (!data) return { ok: false, error: 'the set file could not be read' }
     return {
       ok: true,
-      record: { path: real, data, mtimeMs: stat.mtimeMs, isStale: false, cursor: 0, isFocus: false, playing: null, learned: {} },
+      record: {
+        path: real,
+        data,
+        mtimeMs: stat.mtimeMs,
+        isStale: false,
+        cursor: 0,
+        isFocus: false,
+        playing: null,
+        learned: {},
+        stampPending: null,
+      },
     }
   } catch {
     return { ok: false, error: 'the set file could not be read' }
   }
 }
 
-/** Stores a freshly opened record; one already open keeps its cursor, focus and what it learned. */
+/**
+ * Stores a freshly opened record; one already open keeps its cursor, focus, what it learned, the clip
+ * it is playing and a hand-off stamp it still owes (opening a set again must not make any of those forget).
+ */
 export async function putSet(host: Host, key: string, record: SetRecord): Promise<void> {
   await host.updateSet(key, prev =>
     prev
-      ? { ...record, cursor: clamp(prev.cursor, record.data.items.length), isFocus: prev.isFocus, learned: prev.learned }
+      ? {
+          ...record,
+          cursor: clamp(prev.cursor, record.data.items.length),
+          isFocus: prev.isFocus,
+          learned: prev.learned,
+          playing: prev.playing,
+          stampPending: prev.stampPending ?? null,
+        }
       : record,
   )
 }
@@ -210,13 +271,13 @@ async function readSetInto(host: Host, key: string): Promise<void> {
 
 // ---- previews ----------------------------------------------------------------------------------
 
-export type Want = { itemId: string; where: string; budget: number }
+export type Want = { itemId: string; where: string; budget: number; stamp: string }
 
 /** Previews for items the drawing found missing: queued, newest request first, four at a time. */
 export function fetchPreviews(host: Host, key: string, wants: readonly Want[]): void {
   const jobs: (() => Promise<void>)[] = []
   for (const want of wants) {
-    const id = previewId(key, want.itemId, want.budget)
+    const id = previewId(key, want.itemId, want.budget, want.stamp)
     if (inflight.has(id)) continue
     inflight.add(id)
     jobs.push(() => fetchOne(host, key, id, want))
@@ -239,21 +300,24 @@ function pump(): void {
 
 async function fetchOne(host: Host, key: string, id: string, want: Want): Promise<void> {
   try {
-    if (await host.getPreview(id)) return
-    let entry: PreviewEntry = { preview: null }
+    if (isUsable(await host.getPreview(id), await host.now())) return
+    let preview: PreviewData | null = null
     try {
       const out = await cli(host, 'canvas-preview', [want.where, '--budget', String(want.budget), '--json'])
-      if (out.exitCode === 0) entry = { preview: parsePreview(out.stdout) }
+      if (out.exitCode === 0) preview = parsePreview(out.stdout)
       else host.debug(`canvas-preview exited ${out.exitCode}: ${failure(out.stderr)}`)
     } catch {
       host.debug('canvas-preview could not be run')
     }
-    await storePreview(host, id, entry)
-    const preview = entry.preview
-    if (preview) {
-      const learned = { kind: preview.kind, clip: preview.clip }
-      await host.updateSet(key, r => (r ? { ...r, learned: { ...r.learned, [want.itemId]: learned } } : r))
-    }
+    // A failure is remembered with its time, and tried again after FAILED_PREVIEW_TTL_MS.
+    await storePreview(host, id, preview ? { preview } : { preview: null, at: await host.now() })
+    // What the item is and where its clip lives follow the file: a failed look forgets the old answer.
+    const learned = preview ? { kind: preview.kind, clip: preview.clip } : null
+    await host.updateSet(key, r => {
+      if (!r) return r
+      const { [want.itemId]: _old, ...rest } = r.learned
+      return { ...r, learned: learned ? { ...rest, [want.itemId]: learned } : rest }
+    })
   } catch {
     host.debug('a preview could not be stored')
   } finally {
@@ -333,19 +397,51 @@ async function act(host: Host, key: string, action: MediaAction): Promise<void> 
     case 'open': {
       const item = items[record.cursor]
       if (!item) return
-      const kind = record.learned[item.id]?.kind ?? guessKind(item.where, item.isUrl)
-      const out = await host.run(openArgv(kind, item.where, item.isUrl), 15_000)
+      const { argv, isGuarded } = await openCommand(host, item.where, item.isUrl)
+      const out = await host.run(argv, 15_000)
       if (out.exitCode !== 0) host.toast('Could not open that.')
+      else if (isGuarded) host.toast('Showing it in Finder: it could run as a program, so it is not opened.')
       return
     }
     case 'done':
+      if (mode === 'pick-one') {
+        host.toast('In a pick-one set the pick sends the result: there is no Done.')
+        return
+      }
       await sendResult(host, key, 'done')
       return
   }
 }
 
+/**
+ * How `o` opens an item. The kind comes only from the extension of the item's current path (see openArgv):
+ * a preview's sniffed kind, or what the item was when it was first drawn, is not consulted, since the
+ * set file can be rewritten under the same id. Before a plain open, the file itself is looked at: one
+ * that is not a regular file, whose real path (past any link) names a program, or that has the
+ * executable bit, is only revealed. Anything that cannot be checked is only revealed too.
+ */
+async function openCommand(host: Host, where: string, isLink: boolean): Promise<{ argv: string[]; isGuarded: boolean }> {
+  const argv = openArgv(where, isLink)
+  if (isLink || argv[1] === '-R') return { argv, isGuarded: false }
+  if (await couldRun(host, where)) return { argv: ['open', '-R', where], isGuarded: true }
+  return { argv, isGuarded: false }
+}
+
+async function couldRun(host: Host, where: string): Promise<boolean> {
+  try {
+    const found = await host.stat(where)
+    if (found.kind !== 'file') return true
+    if (found.realPath !== undefined && isRunnablePath(found.realPath)) return true
+    // $.fs.stat answers no mode, so the executable bit is asked of test(1), which follows links.
+    return (await host.run(['/bin/test', '-x', where], 5_000)).exitCode === 0
+  } catch {
+    return true
+  }
+}
+
 async function mark(host: Host, key: string, record: SetRecord, id: string, flags: string[], sendsOnPick: boolean): Promise<void> {
-  const out = await cli(host, 'canvas-set', ['mark', record.path, id, ...flags, '--json'])
+  // The id comes from a file the model may have written: after `--` it cannot be read as an option.
+  const out = await cli(host, 'canvas-set', ['mark', record.path, ...flags, '--json', '--', id])
   if (out.exitCode === 3) {
     host.toast('Already sent to Claude: a new pick would not reach it.')
     return
@@ -356,6 +452,8 @@ async function mark(host: Host, key: string, record: SetRecord, id: string, flag
     host.debug(`canvas-set mark failed: ${failure(out.stderr)}`)
     return
   }
+  // A change that lands while the result is being sent is told apart from one the send already holds.
+  if (result.changed && !result.updatedAfterHandoff && sending.has(key)) dirty.add(key)
   await reloadSet(host, key) // the drawing shows what is on disk
   if (result.updatedAfterHandoff) host.toast('Updated after the result was sent: tell Claude.')
   else if (sendsOnPick) await sendResult(host, key, 'pick')
@@ -363,17 +461,19 @@ async function mark(host: Host, key: string, record: SetRecord, id: string, flag
 
 // ---- playback -----------------------------------------------------------------------------------------
 
+/** Stops the clip when it is one of this set's. */
 function stopPlayback(key: string): void {
-  playing.get(key)?.stop.abort()
+  if (player?.key === key) player.stop.abort()
 }
 
 async function play(host: Host, key: string, record: SetRecord): Promise<void> {
   const item = record.data.items[record.cursor]
   if (!item) return
-  const current = playing.get(key)
+  // One clip at a time across every set: starting this one stops whatever plays, wherever it plays.
+  const current = player
   if (current) {
     current.stop.abort()
-    if (current.id === item.id) return // p again stops it
+    if (current.key === key && current.id === item.id) return // p again stops it
   }
   const learned = record.learned[item.id]
   if (!learned) {
@@ -385,18 +485,20 @@ async function play(host: Host, key: string, record: SetRecord): Promise<void> {
     return
   }
   const stop = new AbortController()
-  playing.set(key, { id: item.id, stop })
+  const mine = { key, id: item.id, stop }
+  player = mine
   try {
     const base64 = await host.readBase64(learned.clip)
     if (stop.signal.aborted) return
     await host.updateSet(key, r => (r ? { ...r, playing: item.id } : r))
+    if (stop.signal.aborted) return // stopped while the record was being written: nothing starts
     await host.play(base64, stop.signal)
   } catch (error) {
     // The engine prefixes a refusal with where it came from ("canvas: $.audio.play: ...").
     const reason = (error instanceof Error ? error.message : String(error)).replace(/^[\w-]+: \$\.[\w.]+:\s*/, '')
     host.toast(`Could not play that: ${oneLine(reason, 120)}`)
   } finally {
-    if (playing.get(key)?.stop === stop) playing.delete(key)
+    if (player === mine) player = null
     await host.updateSet(key, r => (r && r.playing === item.id ? { ...r, playing: null } : r))
   }
 }
@@ -410,11 +512,21 @@ export function stopSet(key: string): void {
 
 export type Trigger = 'pick' | 'done'
 
+type Via = 'submit' | 'fill'
+/** What writing the stamp came to: written, written already by someone, refused (the file changed), or not written. */
+type StampOutcome = 'stamped' | 'already' | 'changed' | 'failed'
+
+/** The words that send the person back to the control that sends: pick-one has no Done. */
+const sendAgain = (mode: string): string => (mode === 'pick-one' ? 'pick again' : 'press Done again')
+
 /**
- * Tells Claude what was curated, once. The summary is read fresh from the file (never from state);
- * an empty prompt box takes it as a prompt, a draft gets it appended and Nick sends; a box that
- * will not take it leaves it for the next prompt to carry. Only then is the hand-off stamped, and a
- * stamp already there ends the matter: Done is refused, a second pick is only a file update.
+ * Tells Claude what was curated. The summary is read fresh from the file (never from state) and carries
+ * a digest of the bytes it was made from; an empty prompt box takes it as a prompt, a draft gets it
+ * appended and Nick sends; a box that will not take it leaves it for the next prompt to carry. Only then
+ * is the hand-off stamped, with that digest: a file that changed while the text was on its way is refused
+ * the stamp, and the changed set is summarised and sent once more (once: a second change asks the
+ * person to press again). A stamp already there ends the matter: Done is refused, a second pick is only
+ * a file update. A stamp that could not be written does not send again; it is retried (see markStampPending).
  */
 export async function sendResult(host: Host, key: string, trigger: Trigger): Promise<void> {
   if (sending.has(key)) {
@@ -423,48 +535,143 @@ export async function sendResult(host: Host, key: string, trigger: Trigger): Pro
   }
   sending.add(key)
   try {
-    const record = await host.getSet(key)
-    if (!record) return
-    const out = await cli(host, 'canvas-set', ['summary', record.path, '--json'])
-    const summary = out.exitCode === 0 ? parseSummary(out.stdout) : null
-    if (!summary) {
-      host.toast('Could not read the set file to send it.')
-      host.debug(`canvas-set summary failed: ${failure(out.stderr)}`)
-      return
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (!(await sendOnce(host, key, trigger, attempt === 0))) return
     }
-    if (summary.isHandedOff) {
-      if (trigger === 'done') host.toast('Already sent to Claude: nothing more to send.')
-      return
-    }
-
-    const text = handoffText(summary)
-    const draft = await host.promptText()
-    let via: 'submit' | 'fill'
-    if (draft.trim() === '') {
-      try {
-        await host.submit(text)
-      } catch {
-        host.toast('Could not send the result to Claude. Press Done again.')
-        return
-      }
-      via = 'submit'
-      host.toast('Sent the curation result to Claude.')
-    } else {
-      via = 'fill'
-      const filled = await host.fill(`${draft.endsWith('\n') ? '' : '\n\n'}${text}`).catch(() => false)
-      if (filled) {
-        host.toast('Added the curation result to your draft: send it when ready.')
-      } else {
-        await host.updatePending(list => [...list.filter(one => one.set !== record.path), { set: record.path, text }])
-        host.toast('Your prompt box is busy: the result goes with your next message.')
-      }
-    }
-
-    const stamp = await cli(host, 'canvas-set', ['handoff', record.path, '--via', via])
-    if (stamp.exitCode !== 0 && stamp.exitCode !== 3) host.debug(`canvas-set handoff failed: ${failure(stamp.stderr)}`)
-    await reloadSet(host, key)
   } finally {
     sending.delete(key)
+    dirty.delete(key)
+  }
+}
+
+/** One summary, one send, one stamp. True when the file changed under it and another round is due. */
+async function sendOnce(host: Host, key: string, trigger: Trigger, isFirst: boolean): Promise<boolean> {
+  const record = await host.getSet(key)
+  if (!record) return false
+  if (record.stampPending) {
+    await pressedWhilePending(host, key, record, trigger)
+    return false
+  }
+  const out = await cli(host, 'canvas-set', ['summary', record.path, '--json'])
+  const summary = out.exitCode === 0 ? parseSummary(out.stdout) : null
+  if (!summary) {
+    host.toast('Could not read the set file to send it.')
+    host.debug(`canvas-set summary failed: ${failure(out.stderr)}`)
+    return false
+  }
+  dirty.delete(key) // every mark so far is in this summary
+  if (summary.isHandedOff) {
+    if (trigger === 'done') host.toast('Already sent to Claude: nothing more to send.')
+    return false
+  }
+
+  const text = handoffText(summary)
+  const draft = await host.promptText()
+  let via: Via
+  if (draft.trim() === '') {
+    try {
+      await host.submit(text)
+    } catch {
+      host.toast(`Could not send the result to Claude. ${sendAgain(record.data.mode).replace(/^./, c => c.toUpperCase())}.`)
+      return false
+    }
+    via = 'submit'
+    host.toast('Sent the curation result to Claude.')
+  } else {
+    via = 'fill'
+    const filled = await host.fill(`${draft.endsWith('\n') ? '' : '\n\n'}${text}`).catch(() => false)
+    if (filled) {
+      host.toast('Added the curation result to your draft: send it when ready.')
+    } else {
+      await host.updatePending(list => [...list.filter(one => one.set !== record.path), { set: record.path, text }])
+      host.toast('Your prompt box is busy: the result goes with your next message.')
+    }
+  }
+
+  // From here the result is out. Nothing below may end in "try again": a second send is a duplicate.
+  const outcome = await stamp(host, record.path, via, summary.digest)
+  if (outcome === 'failed') {
+    await markStampPending(host, key, via, summary.digest)
+    return false
+  }
+  if (outcome === 'changed') {
+    if (isFirst) return true // the text that went is stale: summarise the set as it is now and send that
+    host.toast(`Set changed while sending — ${sendAgain(record.data.mode)}.`)
+    return false
+  }
+  if (dirty.has(key)) host.toast('Updated after the result was sent: tell Claude.')
+  await reloadSet(host, key).catch(() => undefined)
+  return false
+}
+
+async function stamp(host: Host, path: string, via: Via, digest: string): Promise<StampOutcome> {
+  try {
+    const out = await cli(host, 'canvas-set', ['handoff', path, '--via', via, '--expect-digest', digest])
+    if (out.exitCode === 0) return 'stamped'
+    if (out.exitCode === 3) return 'already'
+    if (out.exitCode === 4) return 'changed'
+    host.debug(`canvas-set handoff failed: ${failure(out.stderr)}`)
+  } catch {
+    host.debug('canvas-set handoff could not be run')
+  }
+  return 'failed'
+}
+
+/** The result went but the file does not say so: remember that, so nothing sends it again, and keep trying to write it. */
+async function markStampPending(host: Host, key: string, via: Via, digest: string): Promise<void> {
+  await host.updateSet(key, r => (r ? { ...r, stampPending: { via, digest, retries: 0 } } : r))
+  host.toast('Sent; recording it failed, retrying')
+  scheduleStampRetry(host, key, STAMP_RETRY_MS[0])
+}
+
+function scheduleStampRetry(host: Host, key: string, ms: number): void {
+  host.later(ms, () => void retryStamp(host, key).catch(() => undefined))
+}
+
+async function retryStamp(host: Host, key: string): Promise<void> {
+  if (stamping.has(key)) return // a try is already under way
+  const record = await host.getSet(key)
+  const pending = record?.stampPending
+  if (!record || !pending) return
+  stamping.add(key)
+  try {
+    const clear = () => host.updateSet(key, r => (r ? { ...r, stampPending: null } : r))
+    const outcome = await stamp(host, record.path, pending.via, pending.digest)
+    if (outcome === 'stamped' || outcome === 'already') {
+      await clear()
+      await reloadSet(host, key).catch(() => undefined)
+      host.toast('Recorded that the result was sent.')
+    } else if (outcome === 'changed') {
+      // The set moved on after the text went: that text is no longer the set. Free the next send.
+      await clear()
+      host.toast(`Set changed after it was sent — ${sendAgain(record.data.mode)}.`)
+    } else {
+      const retries = pending.retries + 1
+      await host.updateSet(key, r => (r?.stampPending ? { ...r, stampPending: { ...r.stampPending, retries } } : r))
+      const wait = STAMP_RETRY_MS[retries]
+      if (wait !== undefined) scheduleStampRetry(host, key, wait)
+      else host.toast(`Sent, but recording it failed. ${sendAgain(record.data.mode).replace(/^./, c => c.toUpperCase())} to try recording it again.`)
+    }
+  } finally {
+    stamping.delete(key)
+  }
+}
+
+/** Done or a pick on a set whose result is out but unstamped: never a second send; after the retries ran out, one more go at the stamp. */
+async function pressedWhilePending(host: Host, key: string, record: SetRecord, trigger: Trigger): Promise<void> {
+  if (trigger === 'done') host.toast('Already sent to Claude: still recording it.')
+  const pending = record.stampPending
+  if (pending && pending.retries >= STAMP_RETRY_MS.length) {
+    await host.updateSet(key, r => (r?.stampPending ? { ...r, stampPending: { ...r.stampPending, retries: 0 } } : r))
+    scheduleStampRetry(host, key, 0)
+  }
+}
+
+/** A reload drops the retry timers with the module: the sets that still owe a stamp start their retries again. */
+export async function resumeStamps(host: Host, keys: readonly string[]): Promise<void> {
+  for (const key of keys) {
+    const pending = (await host.getSet(key))?.stampPending
+    if (pending && pending.retries < STAMP_RETRY_MS.length) scheduleStampRetry(host, key, STAMP_RETRY_MS[pending.retries] ?? 0)
   }
 }
 

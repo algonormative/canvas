@@ -22,6 +22,15 @@ const CONTROL_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g
 // eslint-disable-next-line no-control-regex
 const HAS_CONTROL = /[\u0000-\u001F\u007F-\u009F\u2028\u2029]/
 
+// What a link item is, the same rule canvas-set applies (its _URL_RE): http or https, something after the
+// scheme, and no whitespace or control character anywhere. Spelled out, not `\S`, because JavaScript's and
+// Python's whitespace differ at the edges (C0/C1 controls, U+FEFF).
+// eslint-disable-next-line no-control-regex
+const URL_RE = /^https?:\/\/[^\s\u0000-\u001F\u007F-\u009F\u2028\u2029\uFEFF]+$/i
+
+/** Whether `text` is an http(s) link item: the one URL rule the mod and `canvas-set` share. */
+export const isUrl = (text: unknown): text is string => typeof text === 'string' && URL_RE.test(text)
+
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -75,17 +84,17 @@ export function parseSetFile(text: string): SetData | null {
   for (const one of raw.items) {
     if (!isObject(one) || typeof one.id !== 'string' || one.id === '' || seen.has(one.id)) return null
     seen.add(one.id)
-    const isUrl = typeof one.url === 'string'
-    const where = isUrl ? one.url : one.path
-    if (typeof where !== 'string' || (isUrl && 'path' in one)) return null
+    const isLink = typeof one.url === 'string'
+    const where = isLink ? one.url : one.path
+    if (typeof where !== 'string' || (isLink && 'path' in one)) return null
     // Absolute paths and http(s) links only: the value reaches a command line (open, canvas-preview).
-    if (isUrl ? !/^https?:\/\/\S+$/i.test(where) : !where.startsWith('/')) return null
+    if (isLink ? !isUrl(where) : !where.startsWith('/')) return null
     const verdict = one.verdict ?? null
     if (verdict !== null && !VERDICTS.includes(verdict as Verdict)) return null
     const rating = one.rating ?? null
     if (rating !== null && (typeof rating !== 'number' || !Number.isInteger(rating) || rating < 1 || rating > 5)) return null
     const label = typeof one.label === 'string' && one.label.trim() !== '' ? one.label : one.id
-    items.push({ id: one.id, where: where as string, isUrl, label: oneLine(label, 200), verdict: verdict as Verdict | null, rating })
+    items.push({ id: one.id, where: where as string, isUrl: isLink, label: oneLine(label, 200), verdict: verdict as Verdict | null, rating })
   }
   const title = oneLine(raw.title, 100)
   if (title === '') return null
@@ -123,8 +132,8 @@ for (const [kind, exts] of Object.entries({
 }
 
 /** The kind a file name suggests, for the glyph and the card before a preview says better. */
-export function guessKind(where: string, isUrl: boolean): string {
-  if (isUrl) return 'link'
+export function guessKind(where: string, isLink: boolean): string {
+  if (isLink) return 'link'
   const dot = where.lastIndexOf('.')
   const slash = where.lastIndexOf('/')
   if (dot <= slash + 1) return 'unknown'
@@ -205,14 +214,19 @@ export function formatMeta(meta: Readonly<Record<string, number>>, full: boolean
 const TIERS = ['rich', 'reduced', 'card'] as const
 
 /**
- * A text file's own markdown, made inert before it is drawn: images (which a renderer may fetch from anywhere,
- * telling the host the file was looked at) become their alt text, and raw HTML tags are dropped.
+ * A text file's own markdown, made inert before it is drawn. A renderer may fetch an image from anywhere,
+ * telling the host the file was looked at, and pattern-matching the image syntax misses nested and split
+ * forms (`![x [y]](url)`, an `<img` tag broken over lines), so the two ways to ask for one are removed
+ * outright: every `<…>` tag goes (repeatedly, since dropping one can join the pieces of another), and every
+ * `![` becomes `[`, which leaves a link a person must click.
  */
 export function safeMarkdown(text: string): string {
-  return text
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, (_all, alt: string) => (alt.trim() === '' ? '[image]' : `[image: ${alt}]`))
-    .replace(/!\[([^\]]*)\]\[[^\]]*\]/g, (_all, alt: string) => (alt.trim() === '' ? '[image]' : `[image: ${alt}]`))
-    .replace(/<\/?[A-Za-z!][^>\n]*>/g, '')
+  let out = text
+  for (let previous = ''; out !== previous; ) {
+    previous = out
+    out = out.replace(/<[^>]*>/g, '')
+  }
+  return out.replace(/!+\[/g, '[')
 }
 
 /** Whether `source` opens like an SVG document. */
@@ -255,13 +269,33 @@ export function parsePreview(stdout: string): PreviewData | null {
 }
 
 /**
- * What `open` is asked to do with a file, by kind: media and documents open in their app; text and
- * SVG open in a text editor (never in anything that could run them); anything else is only revealed.
- * The set's paths can come from the model, so a path never reaches `open` plain unless its kind is safe.
+ * Extensions of things the system runs when it opens them (applications, scripts, installers, workflows).
+ * A path with one of these is only ever revealed, whatever else is known about it.
  */
-export function openArgv(kind: string, where: string, isUrl: boolean): string[] {
-  if (isUrl) return ['open', where]
-  switch (kind) {
+const RUNNABLE_EXT = new Set(
+  'app command tool terminal sh zsh bash py rb pl js scpt applescript workflow pkg dmg jar'.split(' '),
+)
+
+/** The lower-case extension of the last path component, or '' when it has none. */
+function extensionOf(where: string): string {
+  const dot = where.lastIndexOf('.')
+  return dot <= where.lastIndexOf('/') + 1 ? '' : where.slice(dot + 1).toLowerCase()
+}
+
+/** Whether the system may run a file with this name when asked to open it. */
+export const isRunnablePath = (where: string): boolean => RUNNABLE_EXT.has(extensionOf(where))
+
+/**
+ * What `open` is asked to do with an item: media and documents open in their app; text and SVG open in
+ * a text editor (never in anything that could run them); anything else, and anything whose extension
+ * names a program, is only revealed. The set's paths come from the model, so this looks at one thing:
+ * the extension of the item's current path. What a preview sniffed, or what the item was once, never
+ * counts: an MP3 with a script in front of it is still a `.command` file.
+ */
+export function openArgv(where: string, isLink: boolean): string[] {
+  if (isLink) return ['open', where]
+  if (isRunnablePath(where)) return ['open', '-R', where]
+  switch (guessKind(where, false)) {
     case 'audio':
     case 'image':
     case 'video':
@@ -315,6 +349,8 @@ export type Summary = {
   kept: SummaryEntry[]
   rated: SummaryEntry[]
   isHandedOff: boolean
+  /** sha256 of the set file the summary was read from: `handoff --expect-digest` refuses a changed file. */
+  digest: string
 }
 
 function entries(raw: unknown, withRating: boolean): SummaryEntry[] | null {
@@ -348,6 +384,7 @@ export function parseSummary(stdout: string): Summary | null {
   const kept = entries(raw.kept, false)
   const ratedEntries = entries(raw.rated, true)
   if (!kept || !ratedEntries) return null
+  if (typeof raw.digest !== 'string' || !/^[0-9a-f]{64}$/.test(raw.digest)) return null
   return {
     file: raw.file,
     title: raw.title,
@@ -357,7 +394,21 @@ export function parseSummary(stdout: string): Summary | null {
     kept,
     rated: ratedEntries,
     isHandedOff: isObject(raw.handoff),
+    digest: raw.digest,
   }
+}
+
+/** Longest path (before its quotes) a hand-off carries; a cut one ends in an ellipsis. */
+export const PATH_MAX = 200
+
+/**
+ * A path as the hand-off shows it: control characters stripped, 200 characters at most (an ellipsis marks a
+ * cut), JSON-quoted so a quote, a backslash or a space in it cannot end the field or pass for the next one.
+ * The full path is in the set file.
+ */
+export function quotePath(path: string): string {
+  const clean = path.replace(CONTROL_RE, '')
+  return JSON.stringify(clean.length <= PATH_MAX ? clean : `${clean.slice(0, PATH_MAX - 1)}…`)
 }
 
 /** Most kept or rated items a hand-off lists; the rest are named in a count and live in the set file. */
@@ -365,8 +416,8 @@ export const HANDOFF_LIST_MAX = 40
 
 /**
  * The prompt a finished curation sends:
- * `Curated <title> (<mode>): kept 3, maybe 1, tossed 4, not reviewed 2. Kept: "<label>" <path>; ... Set file: <path>`.
- * Titles and labels are cleaned and cut again here, so the text is safe whatever the CLI handed over.
+ * `Curated <title> (<mode>): kept 3, maybe 1, tossed 4, not reviewed 2. Kept: "<label>" "<path>"; ... Set file: "<path>"`.
+ * Titles, labels and paths are cleaned, cut and quoted again here, so the text is safe whatever the CLI handed over.
  */
 export function handoffText(s: Summary): string {
   const pickMode = s.mode === 'pick-one' || s.mode === 'pick-many'
@@ -388,11 +439,11 @@ export function handoffText(s: Summary): string {
   const shown = listed.slice(0, HANDOFF_LIST_MAX).map(e => {
     const label = e.label.startsWith('"') ? quoteLabel(e.label.slice(1, -1)) : quoteLabel(e.label)
     const rating = e.rating === undefined ? '' : ` ${e.rating}/5`
-    return `${label}${rating} ${oneLine(e.path, 1000)}`
+    return `${label}${rating} ${quotePath(e.path)}`
   })
   const more = listed.length > shown.length ? ` (and ${listed.length - shown.length} more in the set file)` : ''
   const list = shown.length > 0 ? ` ${heading}: ${shown.join('; ')}${more}.` : ''
-  return `Curated ${oneLine(s.title, LABEL_MAX)} (${s.mode}): ${parts.join(', ')}.${list} Set file: ${oneLine(s.file, 1000)}`
+  return `Curated ${oneLine(s.title, LABEL_MAX)} (${s.mode}): ${parts.join(', ')}.${list} Set file: ${quotePath(s.file)}`
 }
 
 // ---- the curate tool's input ------------------------------------------------------------------
@@ -429,7 +480,7 @@ export function parseCurate(input: unknown): Parsed<CurateRequest> {
     if (typeof one !== 'string' || one === '' || one.length > MAX_PATH || HAS_CONTROL.test(one)) {
       return { ok: false, error: `items[${i}]: expected one path of at most ${MAX_PATH} characters` }
     }
-    if (!one.startsWith('/') && !/^https?:\/\/\S+$/i.test(one)) return { ok: false, error: `items[${i}]: must be an absolute path or an http(s) URL` }
+    if (!one.startsWith('/') && !isUrl(one)) return { ok: false, error: `items[${i}]: must be an absolute path or an http(s) URL` }
     items.push(one)
   }
 
