@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -494,3 +496,130 @@ def test_handoff_racing_handoff_stamps_once(tmp_path, media):
         t.join()
     assert sum(isinstance(r, dict) for r in results) == 1
     assert sum(isinstance(r, setfile.HandoffRefused) for r in results) == 3
+
+
+# --- the digest: a hand-off refuses a set that changed since the summary it was built from ------------------
+
+
+def digest_of(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_summary_json_carries_the_sha256_of_the_bytes_it_read(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    assert run_summary(path, capsys)["digest"] == digest_of(path)
+    setfile.main(["mark", str(path), ids(path)[0], "--verdict", "keep"])
+    after = run_summary(path, capsys)["digest"]
+    assert after == digest_of(path)
+
+
+def test_the_digest_follows_every_change_to_the_file(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    first = run_summary(path, capsys)["digest"]
+    setfile.main(["mark", str(path), ids(path)[0], "--verdict", "keep"])
+    second = run_summary(path, capsys)["digest"]
+    setfile.main(["mark", str(path), ids(path)[0], "--verdict", "clear"])
+    third = run_summary(path, capsys)["digest"]
+    assert len({first, second}) == 2
+    assert third == first  # the digest is of the bytes: the same set written the same way hashes the same
+
+
+def test_handoff_with_the_digest_of_the_summary_stamps(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    digest = run_summary(path, capsys)["digest"]
+    assert setfile.main(["handoff", str(path), "--via", "submit", "--expect-digest", digest]) == 0
+    assert "handoff" in read(path)
+
+
+def test_handoff_refuses_a_set_that_changed_since_the_summary_and_writes_nothing(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    digest = run_summary(path, capsys)["digest"]
+    setfile.main(["mark", str(path), ids(path)[1], "--verdict", "keep"])  # a pick made while the send was in flight
+    before = path.read_text()
+    capsys.readouterr()
+    assert setfile.main(["handoff", str(path), "--via", "submit", "--expect-digest", digest]) == 4
+    assert "changed since summary" in capsys.readouterr().err
+    assert path.read_text() == before
+    assert "handoff" not in read(path) and read(path)["done"] is False
+
+
+def test_handoff_refuses_a_change_made_without_mark_too(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    digest = run_summary(path, capsys)["digest"]
+    path.write_text(path.read_text() + "\n")  # only a byte of whitespace: still not what was summarised
+    assert setfile.main(["handoff", str(path), "--via", "fill", "--expect-digest", digest]) == 4
+
+
+def test_the_digest_is_checked_under_the_lock_so_a_mark_cannot_slip_between_check_and_stamp(tmp_path, media, capsys, monkeypatch):
+    path = make(tmp_path, media)
+    digest = run_summary(path, capsys)["digest"]
+    seen = []
+    real_save = setfile._save_valid
+
+    def spy(target, data):
+        seen.append(digest_of(path))
+        real_save(target, data)
+
+    monkeypatch.setattr(setfile, "_save_valid", spy)
+    assert setfile.main(["handoff", str(path), "--via", "submit", "--expect-digest", digest]) == 0
+    assert seen == [digest]  # the file at stamp time is the file that was checked
+
+
+def test_a_handed_off_set_still_says_already_handed_off_before_it_says_changed(tmp_path, media, capsys):
+    path = make(tmp_path, media)
+    digest = run_summary(path, capsys)["digest"]
+    setfile.main(["handoff", str(path), "--via", "fill"])
+    capsys.readouterr()
+    assert setfile.main(["handoff", str(path), "--via", "submit", "--expect-digest", digest]) == 3
+
+
+# --- a set reached through a symlink ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("where", ["beside", "elsewhere"])
+def test_mark_through_a_symlink_edits_the_real_file_and_keeps_the_link(tmp_path, media, where):
+    real = make(tmp_path, media)
+    home = tmp_path if where == "beside" else tmp_path / "links"
+    home.mkdir(exist_ok=True)
+    link = home / "alias.curate.json"
+    link.symlink_to(real)
+    assert setfile.main(["mark", str(link), ids(real)[0], "--verdict", "keep"]) == 0
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert read(real)["items"][0]["verdict"] == "keep"
+    # nothing left behind next to either name
+    assert sorted(p.name for p in home.iterdir() if p.name.startswith(".curate.")) == []
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith(".curate.")) == []
+
+
+def test_mark_through_a_relative_symlink_chain_edits_the_end_of_it(tmp_path, media):
+    real = make(tmp_path, media)
+    (tmp_path / "hop").mkdir()
+    (tmp_path / "hop" / "one.curate.json").symlink_to("../" + real.name)
+    (tmp_path / "two.curate.json").symlink_to("hop/one.curate.json")
+    assert setfile.main(["mark", str(tmp_path / "two.curate.json"), ids(real)[2], "--verdict", "toss"]) == 0
+    assert (tmp_path / "two.curate.json").is_symlink() and (tmp_path / "hop" / "one.curate.json").is_symlink()
+    assert read(real)["items"][2]["verdict"] == "toss"
+
+
+def test_handoff_through_a_symlink_edits_the_real_file_and_keeps_the_link(tmp_path, media):
+    real = make(tmp_path, media)
+    link = tmp_path / "alias.curate.json"
+    link.symlink_to(real)
+    assert setfile.main(["handoff", str(link), "--via", "submit"]) == 0
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert read(real)["handoff"]["via"] == "submit"
+
+
+def test_summary_through_a_symlink_reads_the_real_file(tmp_path, media, capsys):
+    real = make(tmp_path, media)
+    link = tmp_path / "alias.curate.json"
+    link.symlink_to(real)
+    assert run_summary(link, capsys)["digest"] == digest_of(real)
+
+
+def test_a_dangling_symlink_fails_cleanly(tmp_path, capsys):
+    link = tmp_path / "alias.curate.json"
+    link.symlink_to(tmp_path / "nowhere.curate.json")
+    code, out = mark(link, "x", "--verdict", "keep", capsys=capsys)
+    assert code == 1 and "no such file" in out.err
+    assert link.is_symlink()

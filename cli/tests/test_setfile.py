@@ -104,6 +104,75 @@ def test_url_inputs_become_url_items(samples, tmp_path):
     assert setfile.validate_set(data) == []
 
 
+def test_literal_takes_the_paths_as_given_and_never_expands_a_glob(samples, tmp_path, capsys):
+    out = tmp_path / "lit.json"
+    star = str(samples / "kick-*.wav")
+    # without --literal the pattern expands to the three kicks; with it, it is a file name that is not there
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", star]) == 1
+    assert "no such file" in capsys.readouterr().err and not out.exists()
+    # a file that really has a glob character in its name is taken as it is, and only it
+    odd = samples / "odd[1]*.wav"
+    odd.write_bytes(b"RIFF")
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", str(odd)]) == 0
+    assert [i["path"] for i in json.loads(out.read_text())["items"]] == [str(odd)]
+
+
+def test_literal_does_not_expand_a_home_directory_or_a_directory_of_files(samples, tmp_path, capsys):
+    out = tmp_path / "lit.json"
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", "~/anything.wav"]) == 1
+    assert "no such file" in capsys.readouterr().err
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", str(samples)]) == 1
+    assert "directory" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_literal_keeps_the_path_exactly_as_given_and_still_takes_urls(samples, tmp_path):
+    out = tmp_path / "lit.json"
+    unnormalised = f"{samples}/../samples/snare.wav"
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", unnormalised, "https://example.com/x.png"]) == 0
+    items = json.loads(out.read_text())["items"]
+    assert items[0]["path"] == unnormalised and items[1]["url"] == "https://example.com/x.png"
+
+
+def test_without_literal_a_glob_is_still_expanded(samples, tmp_path):
+    out = tmp_path / "g2.json"
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), str(samples / "kick-*.wav")]) == 0
+    assert len(json.loads(out.read_text())["items"]) == 3
+
+
+#: Strings the CLI and the mod must both call a URL, and both must refuse. tests/ in the mod hold the same table.
+URLS_OK = ["https://example.com/a.png", "http://x", "HTTPS://EXAMPLE.COM/A", "https://example.com/a%20b?q=1#frag"]
+URLS_BAD = [
+    "https://", "http://", "https:// a", "https://a b", "https://a\tb", "https://a\nb", "https://a\n", "https://a\u00a0b",
+    "https://a\u2028b", "https://a\x85b", "https://a\x07b", "ftp://x", "file:///etc/passwd", "javascript:alert(1)", "//x.example/a", "https:/x", "",
+]
+
+
+@pytest.mark.parametrize("url", URLS_OK)
+def test_a_url_is_http_or_https_with_something_after_it(valid_set, tmp_path, capsys, url):
+    data = copy.deepcopy(valid_set)
+    del data["items"][0]["path"]
+    data["items"][0]["url"] = url
+    code, err = problems(tmp_path, data, capsys)
+    assert code == 0, err
+
+
+@pytest.mark.parametrize("url", URLS_BAD)
+def test_validate_rejects_a_url_with_whitespace_or_another_scheme(valid_set, tmp_path, capsys, url):
+    data = copy.deepcopy(valid_set)
+    del data["items"][0]["path"]
+    data["items"][0]["url"] = url
+    code, err = problems(tmp_path, data, capsys)
+    assert code == 1 and "url must be an http(s) URL" in err
+
+
+@pytest.mark.parametrize("url", URLS_BAD[:-1])
+def test_new_does_not_take_such_a_string_for_a_url(samples, tmp_path, capsys, url):
+    out = tmp_path / "bad.json"
+    assert new(["--title", "T", "--mode", "triage", "-o", str(out), "--literal", url]) == 1
+    assert "no such file" in capsys.readouterr().err and not out.exists()
+
+
 def test_default_output_is_a_slug_in_the_working_directory(samples, tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     assert new(["--title", "My Kick Set!", "--mode", "triage", str(samples / "snare.wav")]) == 0

@@ -31,8 +31,16 @@ CLEAR = "clear"
 ID_LENGTH = 8
 LABEL_LIMIT = 80
 EXIT_HANDOFF = 3
+EXIT_CHANGED = 4
 _GLOB_CHARS = re.compile(r"[*?\[]")
-_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+# One rule for what a URL item is, shared with the canvas mod (parseSetFile, parseCurate): http or https,
+# something after the scheme, and no whitespace or control character anywhere. Spelled out because Python's
+# \s and JavaScript's \s differ at the edges (C0/C1 controls, U+FEFF).
+_URL_RE = re.compile(r"https?://[^\s\x00-\x1f\x7f-\x9f\u2028\u2029\ufeff]+", re.IGNORECASE)
+
+
+def is_url(text: object) -> bool:
+    return isinstance(text, str) and _URL_RE.fullmatch(text) is not None
 
 
 class SetError(Exception):
@@ -47,6 +55,12 @@ class HandoffRefused(SetError):
     exit_code = EXIT_HANDOFF
 
 
+class ChangedSinceSummary(SetError):
+    """The set is not the file a hand-off was built from: what was sent no longer matches it."""
+
+    exit_code = EXIT_CHANGED
+
+
 # --- building -----------------------------------------------------------------
 
 
@@ -54,12 +68,25 @@ def _natural_key(text: str) -> list:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
-def expand_inputs(inputs: list[str]) -> list[str]:
-    """Absolute paths (and URLs) for ``inputs``: globs expanded, order kept, duplicates dropped."""
+def expand_inputs(inputs: list[str], *, literal: bool = False) -> list[str]:
+    """Absolute paths (and URLs) for ``inputs``: globs expanded, order kept, duplicates dropped.
+
+    With ``literal`` each input is exactly one file: no ``~``, no glob, no normalising. That is the
+    mode for inputs somebody else chose (the canvas mod passes the model's paths this way), where a
+    pattern like ``/Users/me/Documents/*`` must not become every file in the folder.
+    """
     found: list[str] = []
     for raw in inputs:
-        if _URL_RE.match(raw):
+        if is_url(raw):
             found.append(raw)
+            continue
+        if literal:
+            target = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+            if os.path.isdir(target):
+                raise SetError(f"{raw!r} is a directory; pass its files")
+            if not os.path.isfile(target):
+                raise SetError(f"no such file: {raw!r}")
+            found.append(target)
             continue
         expanded = os.path.expanduser(raw)
         if _GLOB_CHARS.search(expanded) and not os.path.exists(expanded):
@@ -85,7 +112,7 @@ def _short_hash(text: str, length: int) -> str:
 
 
 def _label_for(target: str) -> str:
-    if _URL_RE.match(target):
+    if is_url(target):
         tail = target.rstrip("/").rsplit("/", 1)[-1]
         return tail or target
     return os.path.splitext(os.path.basename(target))[0] or os.path.basename(target)
@@ -103,7 +130,7 @@ def build_set(title: str, mode: str, targets: list[str], created_by: str | None 
             item_id = _short_hash(target, length)
         used.add(item_id)
         item: dict = {"id": item_id}
-        item["url" if _URL_RE.match(target) else "path"] = target
+        item["url" if is_url(target) else "path"] = target
         item.update(label=_label_for(target), verdict=None, rating=None, note=None)
         items.append(item)
     return {
@@ -199,7 +226,7 @@ def _validate_item(index: int, item: object, mode: object) -> tuple[list[str], s
             errors.append(f"{where}: path {path!r} is relative; paths must be absolute")
     else:
         url = item["url"]
-        if not isinstance(url, str) or not _URL_RE.match(url):
+        if not is_url(url):
             errors.append(f"{where}: url must be an http(s) URL")
 
     if "label" in item and not isinstance(item["label"], str):
@@ -261,16 +288,22 @@ def validate_set(data: object) -> list[str]:
 # --- reading / summarising --------------------------------------------------------
 
 
-def load_set(path: str) -> object:
+def read_set(path: str) -> tuple[object, str]:
+    """The parsed JSON at ``path`` and the sha256 of the very bytes it was parsed from."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        return json.loads(raw.decode("utf-8")), hashlib.sha256(raw).hexdigest()
     except FileNotFoundError as exc:
         raise SetError(f"no such file: {path}") from exc
     except (OSError, UnicodeDecodeError) as exc:
         raise SetError(f"cannot read {path}: {exc}") from exc
     except ValueError as exc:
         raise SetError(f"{path} is not valid JSON: {exc}") from exc
+
+
+def load_set(path: str) -> object:
+    return read_set(path)[0]
 
 
 def _where(item: dict) -> str:
@@ -346,14 +379,18 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _load_valid(path: str) -> dict:
-    """The set at ``path`` as a dict, or a SetError naming what is wrong with it."""
-    data = load_set(path)
+def _load_valid(path: str, shown: str | None = None) -> tuple[dict, str]:
+    """The set at ``path`` as a dict with its digest, or a SetError naming what is wrong with it.
+
+    ``shown`` is the name the person typed (``path`` may be the real file behind a link).
+    """
+    data, digest = read_set(path)
     errors = validate_set(data)
     if errors:
-        raise SetError(f"{path} is not a valid set ({errors[0]}); run: canvas-set validate {path}")
+        name = shown or path
+        raise SetError(f"{name} is not a valid set ({errors[0]}); run: canvas-set validate {name}")
     assert isinstance(data, dict)
-    return data
+    return data, digest
 
 
 def _save_valid(path: str, data: dict) -> None:
@@ -401,8 +438,11 @@ def mark_item(
     if rating is not None and (not _is_int(rating) or not 1 <= rating <= 5):
         raise SetError(f"rating must be a whole number from 1 to 5 (got {rating!r})")
 
-    with locked(path):
-        data = _load_valid(path)
+    # Every step below happens on the real file: a set reached through a link is edited in place, and
+    # the rename in write_set must replace the file, not the link.
+    real = os.path.realpath(path)
+    with locked(real):
+        data, _digest = _load_valid(real, path)
         items = data["items"]
         mode = data["mode"]
         target = next((i for i in items if i["id"] == item_id), None)
@@ -434,7 +474,7 @@ def mark_item(
             target["note"] = note or None
         changed = json.dumps(items, sort_keys=True) != before
         if changed:
-            _save_valid(path, data)
+            _save_valid(real, data)
 
         return {
             "id": item_id,
@@ -448,17 +488,24 @@ def mark_item(
         }
 
 
-def record_handoff(path: str, via: str) -> dict:
-    """Stamp the set as handed off (and done). Refuses a second time: Claude is told once."""
+def record_handoff(path: str, via: str, expect_digest: str | None = None) -> dict:
+    """Stamp the set as handed off (and done). Refuses a second time: Claude is told once.
+
+    With ``expect_digest`` (the digest ``summary`` printed) the stamp is refused, under the same lock
+    that guards the write, if the file is no longer the one the hand-off was built from.
+    """
     if via not in HANDOFF_VIA:
         raise SetError(f"--via must be one of {', '.join(HANDOFF_VIA)} (got {via!r})")
-    with locked(path):
-        data = _load_valid(path)
+    real = os.path.realpath(path)
+    with locked(real):
+        data, digest = _load_valid(real, path)
         if "handoff" in data:
             raise HandoffRefused(f"{path} was already handed off ({data['handoff']['sentAt']}, via {data['handoff']['via']})")
+        if expect_digest is not None and expect_digest != digest:
+            raise ChangedSinceSummary(f"{path} changed since summary; run canvas-set summary again")
         data["handoff"] = {"sentAt": _now(), "via": via}
         data["done"] = True
-        _save_valid(path, data)
+        _save_valid(real, data)
         return data["handoff"]
 
 
@@ -475,8 +522,12 @@ def quoted_label(item: dict) -> str:
 
 
 def summary_of(path: str) -> dict:
-    """What a hand-off to Claude is built from, read fresh from the file."""
-    data = _load_valid(path)
+    """What a hand-off to Claude is built from, read fresh from the file.
+
+    ``digest`` is the sha256 of the bytes this summary was made from: ``handoff --expect-digest``
+    refuses to stamp a file that has changed since.
+    """
+    data, digest = _load_valid(os.path.realpath(path), path)
     items = data["items"]
     mode = data["mode"]
 
@@ -493,6 +544,7 @@ def summary_of(path: str) -> dict:
         "rated": [],
         "done": data["done"],
         "handoff": data.get("handoff"),
+        "digest": digest,
     }
     if mode == "rate":
         rated = [i for i in items if i.get("rating") is not None]
@@ -508,7 +560,7 @@ def _cmd_new(args: argparse.Namespace) -> int:
     title = args.title.strip()
     if not title:
         raise SetError("--title must not be empty")
-    targets = expand_inputs(args.inputs)
+    targets = expand_inputs(args.inputs, literal=args.literal)
     data = build_set(title, args.mode, targets, args.created_by)
     if args.output == "-":
         json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
@@ -550,7 +602,7 @@ def _cmd_mark(args: argparse.Namespace) -> int:
 
 
 def _cmd_handoff(args: argparse.Namespace) -> int:
-    handoff = record_handoff(args.file, args.via)
+    handoff = record_handoff(args.file, args.via, args.expect_digest)
     print(f"handed off {os.path.abspath(args.file)} ({handoff['sentAt']}, via {handoff['via']})")
     return 0
 
@@ -584,6 +636,11 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--created-by", default=None, dest="created_by")
     new.add_argument("-o", "--output", default=None, help="output file ('-' for stdout); default <title-slug>.curate.json")
     new.add_argument("--force", action="store_true", help="overwrite the output file if it exists")
+    new.add_argument(
+        "--literal",
+        action="store_true",
+        help="take every input as exactly one file: no glob, no ~, no normalising (for paths somebody else chose)",
+    )
     new.add_argument("inputs", nargs="+", metavar="PATH_OR_GLOB")
     new.set_defaults(func=_cmd_new)
 
@@ -609,10 +666,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     handoff = sub.add_parser(
         "handoff",
-        help="stamp the set as handed off to Claude (and done); exit 3 if it already was",
+        help="stamp the set as handed off to Claude (and done); exit 3 if it already was, 4 if it changed since the summary",
     )
     handoff.add_argument("file")
     handoff.add_argument("--via", required=True, choices=HANDOFF_VIA)
+    handoff.add_argument(
+        "--expect-digest",
+        dest="expect_digest",
+        default=None,
+        help="the digest from 'summary --json'; refuse (exit 4, 'changed since summary') if the file is no longer that one",
+    )
     handoff.set_defaults(func=_cmd_handoff)
 
     summary = sub.add_parser(
