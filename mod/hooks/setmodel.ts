@@ -453,3 +453,26 @@ export function inlineSetName(title: string, nowMs: number): string {
   const stamp = new Date(nowMs).toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '')
   return `${slug === '' ? 'set' : slug}-${stamp}.curate.json`
 }
+
+/** How much of a file `canvas-preview` puts in the clip it plays (its CLIP_SECONDS). */
+export const CLIP_SECONDS = 60
+
+/**
+ * The waveform with a playhead that sweeps across it as the clip plays: a SMIL-animated line, no
+ * script. The waveform spans the whole file but the clip only its first CLIP_SECONDS, so on a
+ * longer file the line stops where the clip ends. `null` when the duration or the viewBox is unknown.
+ */
+export function withPlayhead(svg: string, durationSeconds: number | undefined): string | null {
+  if (durationSeconds === undefined || !(durationSeconds > 0)) return null
+  const box = /viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"/.exec(svg)
+  const end = svg.lastIndexOf('</svg>')
+  if (!box || end < 0) return null
+  const width = Number(box[1])
+  const height = Number(box[2])
+  if (!(width > 0) || !(height > 0)) return null
+  const seconds = Math.min(durationSeconds, CLIP_SECONDS)
+  const to = (width * seconds) / durationSeconds
+  const sweep = (attr: string) => `<animate attributeName="${attr}" from="0" to="${to.toFixed(1)}" dur="${seconds.toFixed(3)}s" fill="freeze"/>`
+  const line = `<line x1="0" y1="0" x2="0" y2="${height}" stroke="#e8a33d" stroke-width="2" vector-effect="non-scaling-stroke">${sweep('x1')}${sweep('x2')}</line>`
+  return svg.slice(0, end) + line + svg.slice(end)
+}

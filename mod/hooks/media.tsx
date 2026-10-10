@@ -13,7 +13,7 @@ import {
   widthPx,
 } from './layout'
 import type { Page } from './layout'
-import { countsOf, formatMeta, guessKind, kindGlyph, quoteLabel, reasonText } from './setmodel'
+import { countsOf, formatMeta, guessKind, kindGlyph, quoteLabel, reasonText, withPlayhead } from './setmodel'
 
 // The media panel: one renderer for a curate pane and for the `media` panel of a `show` pane.
 // It takes the elements of the surface (never `$`), reads its state through `Host`, and turns the
@@ -269,11 +269,15 @@ function picture(ctx: Ctx, item: SetItem, entry: PreviewEntry | null | undefined
 
   if (p.svg !== null) {
     if (!Svg) return fallback([formatMeta(p.meta, full), 'pictures need the desktop app'], p.kind)
-    const weight = p.svg.length
+    const playhead = p.kind === 'audio' && ctx.record.playing === item.id ? withPlayhead(p.svg, p.meta.duration) : null
+    const source = playhead ?? p.svg
+    const weight = source.length
     // Whatever the CLI sent, one Svg stays under the element cap, the item's share and what the page has left.
     if (weight > Math.min(SVG_ELEMENT_MAX, ctx.itemBudget) || weight > ctx.svgLeft) return fallback([formatMeta(p.meta, full), reasonText('budget')], p.kind)
     ctx.svgLeft -= weight
-    return <Svg source={p.svg} alt={`${p.kind} preview of ${quoteLabel(item.label)}`} width={px} />
+    const alt = `${p.kind} preview of ${quoteLabel(item.label)}${playhead ? ', playing' : ''}`
+    // A playhead animates (SMIL), which only the sandboxed frame of an interactive Svg runs.
+    return playhead ? <Svg source={source} alt={alt} width={px} isInteractive /> : <Svg source={source} alt={alt} width={px} />
   }
   if (p.markdown !== null) {
     const text = full ? p.markdown : firstLines(p.markdown, 5, 400)

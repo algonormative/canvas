@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, RegisteredToolSpec, SessionStartInput } from 'claude-code'
 
 import { SVG_ELEMENT_MAX, SVG_PAGE_BUDGET, planPage } from './layout'
-import { handoffText, keyOf, parseMarkResult, parsePreview, parseSetFile, parseSummary } from './setmodel'
+import { handoffText, keyOf, parseMarkResult, parsePreview, parseSetFile, parseSummary, withPlayhead } from './setmodel'
 
 // The curate tool and the media panel, end to end on the engine's kit. The canvas CLIs are
 // replaced by `fakeCli` below, which keeps set files in memory and speaks the same JSON the real
@@ -785,12 +785,18 @@ test('p plays the clip of the item under the cursor; p again, or moving the curs
   expect(w.plays).toEqual([{ mime: 'audio/mpeg', base64: 'QUJD' }])
   expect((await ui.find({ type: 'Button', key: HK('play') }))?.props.label).toBe('stop')
   expect(await ui.find({ type: 'Text', text: 'playing' })).toBeDefined()
+  // The playing item's waveform carries a playhead, which only an interactive Svg animates.
+  const playingSvgs = async () => (await ui.findAll({ type: 'Svg' })).filter(svg => /, playing$/.test(String(svg.props.alt)))
+  const [sweeping] = await playingSvgs()
+  expect(sweeping?.props.isInteractive).toBe(true)
+  expect(String(sweeping?.props.source)).toContain('<animate attributeName="x1" from="0" to="400.0" dur="0.420s"')
 
   // Moving to another item stops it.
   await ui.press({ key: HK('next') })
   await clock.settle()
   expect(w.stopped).toBe(1)
   expect((await ui.find({ type: 'Button', key: HK('play') }))?.props.label).toBe('play')
+  expect(await playingSvgs()).toHaveLength(0)
 
   // p again on the same item toggles; it never plays two at once.
   await ui.press({ key: HK('play') })
@@ -807,6 +813,17 @@ test('p plays the clip of the item under the cursor; p again, or moving the curs
   await ui.press({ key: 'm0:v:k04:maybe' })
   await clock.settle()
   expect(w.stopped).toBe(3)
+})
+
+test('the playhead sweeps the clip, which is the first 60 s: on a longer file it stops short of the end', async () => {
+  const wave = svgOf(500)
+  expect(withPlayhead(wave, 30)).toContain('to="400.0" dur="30.000s"')
+  // A 240 s file plays a 60 s clip: a quarter of the waveform, in 60 s.
+  expect(withPlayhead(wave, 240)).toContain('to="100.0" dur="60.000s"')
+  expect(withPlayhead(wave, 240)?.endsWith('</line></svg>')).toBe(true)
+  expect(withPlayhead(wave, undefined)).toBeNull()
+  expect(withPlayhead(wave, 0)).toBeNull()
+  expect(withPlayhead('<svg xmlns="http://www.w3.org/2000/svg"></svg>', 5)).toBeNull()
 })
 
 test('p says why when there is nothing to play, and toasts the reason when playing is refused', async ($, on) => {
