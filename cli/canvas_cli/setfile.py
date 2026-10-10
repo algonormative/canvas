@@ -9,6 +9,8 @@ and ``pick`` (pick-one / pick-many); ``null`` means undecided. ``keep`` and
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import glob
 import hashlib
 import json
@@ -16,20 +18,33 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime
+from datetime import UTC, datetime
+
+from . import cache
 
 VERSION = 1
 MODES = ("pick-one", "pick-many", "triage", "rate")
 VERDICTS = ("keep", "toss", "maybe", "pick")
 POSITIVE_VERDICTS = ("keep", "pick")
 HANDOFF_VIA = ("submit", "fill")
+CLEAR = "clear"
 ID_LENGTH = 8
+LABEL_LIMIT = 80
+EXIT_HANDOFF = 3
 _GLOB_CHARS = re.compile(r"[*?\[]")
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
 class SetError(Exception):
     """A user-facing problem (bad arguments, unreadable file)."""
+
+    exit_code = 1
+
+
+class HandoffRefused(SetError):
+    """The set was already handed off to Claude and the request would send it again."""
+
+    exit_code = EXIT_HANDOFF
 
 
 # --- building -----------------------------------------------------------------
@@ -300,6 +315,192 @@ def summarize(data: dict) -> str:
     return "\n".join(lines)
 
 
+# --- editing: mark, handoff, summary ---------------------------------------------------
+
+
+@contextlib.contextmanager
+def locked(path: str):
+    """Hold an exclusive lock while one process reads, changes and rewrites ``path``.
+
+    The rename in :func:`write_set` keeps a reader from ever seeing a torn file, but
+    two writers that each read before the other wrote would still lose an update.
+    The lock lives under the canvas cache root (not beside the set) and is keyed on
+    the real path, so a set reached through a symlink locks the same file.
+    """
+    real = os.path.realpath(path)
+    lock_dir = cache.cache_root() / "locks"
+    name = hashlib.sha1(real.encode("utf-8", "surrogateescape")).hexdigest()
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_dir / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise SetError(f"cannot lock {path}: {exc}") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _load_valid(path: str) -> dict:
+    """The set at ``path`` as a dict, or a SetError naming what is wrong with it."""
+    data = load_set(path)
+    errors = validate_set(data)
+    if errors:
+        raise SetError(f"{path} is not a valid set ({errors[0]}); run: canvas-set validate {path}")
+    assert isinstance(data, dict)
+    return data
+
+
+def _save_valid(path: str, data: dict) -> None:
+    """Write ``data`` over ``path`` only if it is still a valid set afterwards."""
+    errors = validate_set(data)
+    if errors:
+        raise SetError(f"refusing to write an invalid set: {errors[0]}")
+    write_set(path, data, overwrite=True)
+
+
+def counts_of(items: list[dict]) -> dict:
+    """keep (keep or pick), maybe, toss, notReviewed (no verdict and no rating) and rated (any rating)."""
+    counts = {"keep": 0, "maybe": 0, "toss": 0, "notReviewed": 0, "rated": 0}
+    for item in items:
+        if item.get("rating") is not None:
+            counts["rated"] += 1
+        verdict = item.get("verdict")
+        if verdict in POSITIVE_VERDICTS:
+            counts["keep"] += 1
+        elif verdict in ("maybe", "toss"):
+            counts[verdict] += 1
+        elif item.get("rating") is None:
+            counts["notReviewed"] += 1
+    return counts
+
+
+def mark_item(
+    path: str,
+    item_id: str,
+    *,
+    verdict: str | None = None,
+    rating: int | None = None,
+    note: str | None = None,
+) -> dict:
+    """Change one item of the set at ``path``; every other item is left as it was.
+
+    ``verdict`` is one of VERDICTS or ``"clear"`` (which also drops the rating).
+    A positive verdict in a pick-one set takes the pick from whichever item had it.
+    Returns what changed, for the caller to redraw from.
+    """
+    if verdict is None and rating is None and note is None:
+        raise SetError("nothing to mark: give --verdict, --rating or --note")
+    if verdict is not None and verdict != CLEAR and verdict not in VERDICTS:
+        raise SetError(f"verdict must be one of {', '.join((*VERDICTS, CLEAR))} (got {verdict!r})")
+    if rating is not None and (not _is_int(rating) or not 1 <= rating <= 5):
+        raise SetError(f"rating must be a whole number from 1 to 5 (got {rating!r})")
+
+    with locked(path):
+        data = _load_valid(path)
+        items = data["items"]
+        mode = data["mode"]
+        target = next((i for i in items if i["id"] == item_id), None)
+        if target is None:
+            raise SetError(f"no item with id {item_id!r} in {path}")
+        if rating is not None and mode != "rate":
+            raise SetError(f"--rating is for sets in mode 'rate'; this set is {mode!r}")
+        handed_off = "handoff" in data
+        if verdict == "pick" and handed_off and mode != "pick-one":
+            raise HandoffRefused(
+                f"{path} was already handed off ({data['handoff']['sentAt']}); a pick now would not reach Claude"
+            )
+
+        before = json.dumps(items, sort_keys=True)
+        cleared: list[str] = []
+        if verdict == CLEAR:
+            target["verdict"] = None
+            target["rating"] = None
+        elif verdict is not None:
+            target["verdict"] = verdict
+            if mode == "pick-one" and verdict in POSITIVE_VERDICTS:
+                for other in items:
+                    if other is not target and other.get("verdict") in POSITIVE_VERDICTS:
+                        other["verdict"] = None
+                        cleared.append(other["id"])
+        if rating is not None:
+            target["rating"] = rating
+        if note is not None:
+            target["note"] = note or None
+        changed = json.dumps(items, sort_keys=True) != before
+        if changed:
+            _save_valid(path, data)
+
+        return {
+            "id": item_id,
+            "verdict": target.get("verdict"),
+            "rating": target.get("rating"),
+            "note": target.get("note"),
+            "cleared": cleared,
+            "changed": changed,
+            "updatedAfterHandoff": changed and handed_off,
+            "counts": counts_of(items),
+        }
+
+
+def record_handoff(path: str, via: str) -> dict:
+    """Stamp the set as handed off (and done). Refuses a second time: Claude is told once."""
+    if via not in HANDOFF_VIA:
+        raise SetError(f"--via must be one of {', '.join(HANDOFF_VIA)} (got {via!r})")
+    with locked(path):
+        data = _load_valid(path)
+        if "handoff" in data:
+            raise HandoffRefused(f"{path} was already handed off ({data['handoff']['sentAt']}, via {data['handoff']['via']})")
+        data["handoff"] = {"sentAt": _now(), "via": via}
+        data["done"] = True
+        _save_valid(path, data)
+        return data["handoff"]
+
+
+def clean_text(text: object, limit: int) -> str:
+    """One line, no control characters, at most ``limit`` characters (an ellipsis marks a cut)."""
+    flat = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", " ", str(text))).strip()
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "\u2026"
+
+
+def quoted_label(item: dict) -> str:
+    """The item's label in double quotes, 80 characters at most with the quotes, inner quotes softened."""
+    inner = clean_text(item.get("label") or item.get("id") or "", LABEL_LIMIT - 2).replace('"', "'")
+    return f'"{inner}"'
+
+
+def summary_of(path: str) -> dict:
+    """What a hand-off to Claude is built from, read fresh from the file."""
+    data = _load_valid(path)
+    items = data["items"]
+    mode = data["mode"]
+
+    def entry(item: dict) -> dict:
+        return {"label": quoted_label(item), "path": clean_text(_where(item), 4096)}
+
+    summary = {
+        "file": os.path.abspath(path),
+        "title": clean_text(data["title"], LABEL_LIMIT),
+        "mode": mode,
+        "total": len(items),
+        "counts": counts_of(items),
+        "kept": [entry(i) for i in items if i.get("verdict") in POSITIVE_VERDICTS],
+        "rated": [],
+        "done": data["done"],
+        "handoff": data.get("handoff"),
+    }
+    if mode == "rate":
+        rated = [i for i in items if i.get("rating") is not None]
+        rated.sort(key=lambda i: -i["rating"])
+        summary["rated"] = [{**entry(i), "rating": i["rating"]} for i in rated]
+    return summary
+
+
 # --- CLI ----------------------------------------------------------------------------
 
 
@@ -328,6 +529,37 @@ def _cmd_show(args: argparse.Namespace) -> int:
         raise SetError(f"{args.file} is not a set file (run: canvas-set validate {args.file})")
     print(summarize(data))
     return 0
+
+
+def _cmd_mark(args: argparse.Namespace) -> int:
+    result = mark_item(args.file, args.item_id, verdict=args.verdict, rating=args.rating, note=args.note)
+    if args.json:
+        print(json.dumps(result))
+        return 0
+    bits = [f"verdict={result['verdict'] or '-'}"]
+    if result["rating"] is not None:
+        bits.append(f"rating={result['rating']}")
+    if result["note"]:
+        bits.append("note set")
+    print(f"marked {result['id']}: {' '.join(bits)}")
+    for other in result["cleared"]:
+        print(f"cleared the earlier pick {other}")
+    if result["updatedAfterHandoff"]:
+        print("updated-after-handoff")
+    return 0
+
+
+def _cmd_handoff(args: argparse.Namespace) -> int:
+    handoff = record_handoff(args.file, args.via)
+    print(f"handed off {os.path.abspath(args.file)} ({handoff['sentAt']}, via {handoff['via']})")
+    return 0
+
+
+def _cmd_summary(args: argparse.Namespace) -> int:
+    if args.json:
+        print(json.dumps(summary_of(args.file)))
+        return 0
+    return _cmd_show(args)
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
@@ -359,6 +591,38 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("file")
     show.set_defaults(func=_cmd_show)
 
+    mark = sub.add_parser(
+        "mark",
+        help="record a verdict, rating or note on one item (read-modify-write under a lock)",
+        description="Change one item of a set. --verdict clear also drops the rating. "
+        "In a pick-one set a new pick clears the old one. Exit 3 when the set was already handed "
+        "off and the pick would not reach Claude (a pick in pick-one is rewritten and the output "
+        "says updated-after-handoff).",
+    )
+    mark.add_argument("file")
+    mark.add_argument("item_id", metavar="ITEM_ID")
+    mark.add_argument("--verdict", choices=(*VERDICTS, CLEAR))
+    mark.add_argument("--rating", type=int, choices=range(1, 6), metavar="1-5")
+    mark.add_argument("--note", help="free text; an empty string removes the note")
+    mark.add_argument("--json", action="store_true", help="print the result as JSON")
+    mark.set_defaults(func=_cmd_mark)
+
+    handoff = sub.add_parser(
+        "handoff",
+        help="stamp the set as handed off to Claude (and done); exit 3 if it already was",
+    )
+    handoff.add_argument("file")
+    handoff.add_argument("--via", required=True, choices=HANDOFF_VIA)
+    handoff.set_defaults(func=_cmd_handoff)
+
+    summary = sub.add_parser(
+        "summary",
+        help="what a hand-off is built from: counts, kept or picked items, ratings (read fresh from the file)",
+    )
+    summary.add_argument("file")
+    summary.add_argument("--json", action="store_true", help="print the summary as JSON")
+    summary.set_defaults(func=_cmd_summary)
+
     check = sub.add_parser("validate", help="check a set file; non-zero exit with messages if invalid")
     check.add_argument("file")
     check.set_defaults(func=_cmd_validate)
@@ -371,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except SetError as exc:
         print(f"canvas-set: {exc}", file=sys.stderr)
-        return 1
+        return exc.exit_code
 
 
 if __name__ == "__main__":
