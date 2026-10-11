@@ -59,6 +59,8 @@ const SPAWN_FAILURE_MS = 2_000
 /** A preview that failed is tried again once it is this old (the next time the item is drawn). */
 export const FAILED_PREVIEW_TTL_MS = 30_000
 /** Waits before each retry of a hand-off stamp that could not be written; three retries in all. */
+/** How often an open set's file is looked at for an edit made outside the pane. */
+export const SET_POLL_MS = 3_000
 const STAMP_RETRY_MS = [2_000, 6_000, 20_000] as const
 
 export type MediaAction =
@@ -82,6 +84,10 @@ const sending = new Set<string>()
 /** Sets with a mark that landed while their result was being sent. */
 const dirty = new Set<string>()
 const stamping = new Set<string>()
+/** Preview ids of the items on the page each panel of a set is drawing now (set key, then panel index). */
+const visible = new Map<string, Map<number, Set<string>>>()
+/** Sets whose file is being polled for outside edits. */
+const watching = new Set<string>()
 /** The one clip that plays, in whichever set: starting another stops it. */
 let player: { key: string; id: string; stop: AbortController } | null = null
 
@@ -273,6 +279,18 @@ async function readSetInto(host: Host, key: string): Promise<void> {
 
 export type Want = { itemId: string; where: string; budget: number; stamp: string }
 
+/** What one panel of a set is drawing now: a queued preview for anything else is dropped before it runs. */
+export function setVisible(key: string, panel: number, ids: readonly string[]): void {
+  const panels = visible.get(key) ?? new Map<number, Set<string>>()
+  panels.set(panel, new Set(ids))
+  visible.set(key, panels)
+}
+
+function isVisible(key: string, id: string): boolean {
+  for (const ids of visible.get(key)?.values() ?? []) if (ids.has(id)) return true
+  return false
+}
+
 /** Previews for items the drawing found missing: queued, newest request first, four at a time. */
 export function fetchPreviews(host: Host, key: string, wants: readonly Want[]): void {
   const jobs: (() => Promise<void>)[] = []
@@ -300,6 +318,7 @@ function pump(): void {
 
 async function fetchOne(host: Host, key: string, id: string, want: Want): Promise<void> {
   try {
+    if (!isVisible(key, id)) return // queued while its page was showing, and the page has moved on
     if (isUsable(await host.getPreview(id), await host.now())) return
     let preview: PreviewData | null = null
     try {
@@ -501,6 +520,39 @@ async function play(host: Host, key: string, record: SetRecord): Promise<void> {
     if (player === mine) player = null
     await host.updateSet(key, r => (r && r.playing === item.id ? { ...r, playing: null } : r))
   }
+}
+
+/**
+ * A curate pane closed: its clip stops, its polling ends and its record leaves $.state. A record that still owes a
+ * hand-off stamp stays until the retries are done with it.
+ */
+export async function closeSet(host: Host, key: string): Promise<void> {
+  stopPlayback(key)
+  visible.delete(key)
+  watching.delete(key)
+  await host.updateSet(key, r => (r?.stampPending ? r : null))
+}
+
+/** Looks at the set file every SET_POLL_MS while its record is in $.state, and reads it again when its mtime moved. */
+export function watchSet(host: Host, key: string): void {
+  if (watching.has(key)) return
+  watching.add(key)
+  const tick = async (): Promise<void> => {
+    if (!watching.has(key)) return
+    try {
+      const record = await host.getSet(key)
+      if (!record) {
+        watching.delete(key)
+        return
+      }
+      const { mtimeMs } = await host.stat(record.path)
+      if (mtimeMs !== record.mtimeMs) await reloadSet(host, key)
+    } catch {
+      // the file is gone for now: the drawing says so; keep looking
+    }
+    if (watching.has(key)) host.later(SET_POLL_MS, () => void tick())
+  }
+  host.later(SET_POLL_MS, () => void tick())
 }
 
 /** Stops whatever plays for this set (a pane closing, say). */

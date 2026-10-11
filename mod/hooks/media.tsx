@@ -1,7 +1,7 @@
 import type { Elements } from 'claude-code'
 
 import type { PreviewEntry, SetItem, SetRecord, Verdict } from '../types'
-import { fetchPreviews, isUsable, previewId, reloadSet, reopenSet, runAction, statStamp } from './curate'
+import { fetchPreviews, isUsable, previewId, reloadSet, reopenSet, runAction, setVisible, statStamp } from './curate'
 import type { Host, MediaAction, Want } from './curate'
 import {
   FOCUS_MAX_PX,
@@ -96,18 +96,21 @@ export async function renderMediaPanel(host: Host, kit: Kit, opt: MediaOptions):
   const here = items.slice(page.start, page.end)
   const entries = new Map<string, PreviewEntry | null>()
   const wants: Want[] = []
+  const shown: string[] = []
   if (page.budget > 0) {
     const now = await host.now()
     for (const item of here) {
       if (item.isUrl) continue
       // A preview is of the file as it was: a changed mtime or size asks again, and so does a failure after a while.
       const stamp = await statStamp(host, item.where)
+      shown.push(previewId(opt.key, item.id, page.budget, stamp))
       const found = await host.getPreview(previewId(opt.key, item.id, page.budget, stamp))
       const entry = isUsable(found, now) ? found : null
       entries.set(item.id, entry)
       if (!entry) wants.push({ itemId: item.id, where: item.where, budget: page.budget, stamp })
     }
   }
+  setVisible(opt.key, opt.index, shown)
   if (wants.length > 0) host.later(0, () => fetchPreviews(host, opt.key, wants))
 
   const ctx: Ctx = {

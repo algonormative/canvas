@@ -434,15 +434,20 @@ export function handoffText(s: Summary): string {
   }
   parts.push(`not reviewed ${c.notReviewed}`)
 
-  const listed = s.mode === 'rate' ? s.rated : s.kept
-  const heading = s.mode === 'rate' ? 'Rated' : pickMode ? 'Picked' : 'Kept'
-  const shown = listed.slice(0, HANDOFF_LIST_MAX).map(e => {
-    const label = e.label.startsWith('"') ? quoteLabel(e.label.slice(1, -1)) : quoteLabel(e.label)
-    const rating = e.rating === undefined ? '' : ` ${e.rating}/5`
-    return `${label}${rating} ${quotePath(e.path)}`
-  })
-  const more = listed.length > shown.length ? ` (and ${listed.length - shown.length} more in the set file)` : ''
-  const list = shown.length > 0 ? ` ${heading}: ${shown.join('; ')}${more}.` : ''
+  const section = (heading: string, listed: Summary['kept']): string => {
+    const shown = listed.slice(0, HANDOFF_LIST_MAX).map(e => {
+      const label = e.label.startsWith('"') ? quoteLabel(e.label.slice(1, -1)) : quoteLabel(e.label)
+      const rating = e.rating === undefined ? '' : ` ${e.rating}/5`
+      return `${label}${rating} ${quotePath(e.path)}`
+    })
+    const more = listed.length > shown.length ? ` (and ${listed.length - shown.length} more in the set file)` : ''
+    return shown.length > 0 ? ` ${heading}: ${shown.join('; ')}${more}.` : ''
+  }
+  // A rate set lists the ratings, and the items marked y as well: the counts alone would not say which they are.
+  const list =
+    s.mode === 'rate'
+      ? section('Rated', s.rated) + section(pickMode ? 'Picked' : 'Kept', s.kept)
+      : section(pickMode ? 'Picked' : 'Kept', s.kept)
   return `Curated ${oneLine(s.title, LABEL_MAX)} (${s.mode}): ${parts.join(', ')}.${list} Set file: ${quotePath(s.file)}`
 }
 

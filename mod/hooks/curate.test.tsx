@@ -4,7 +4,7 @@ import type { On, RegisteredToolSpec, SessionStartInput } from 'claude-code'
 
 import type { SetRecord } from '../types'
 
-import { resumeStamps, runAction } from './curate'
+import { closeSet, resumeStamps, runAction, watchSet } from './curate'
 import type { Host } from './curate'
 import { SVG_ELEMENT_MAX, SVG_PAGE_BUDGET, planPage } from './layout'
 import {
@@ -2284,4 +2284,75 @@ test('markdown from a file loses every way of asking for an image or HTML, neste
     expect(out, input).toBe(expected)
     expect(out).not.toMatch(/!\[|<[a-z!/]/i)
   }
+})
+
+// ---- vault-ylvpq: deferred review nits ---------------------------------------------------------------
+
+test('an open curate pane notices an edit made outside, without being drawn again', async ($, on) => {
+  const w = world(on)
+  const clock = mock.clock(on)
+  const { file, ui } = await opened($, w, clock)
+  expect(await headerOf(ui)).toContain('kept 0')
+
+  const set = filed(w, file)
+  set.items[1]!.verdict = 'keep'
+  save(w, file, set) // `canvas-set mark` from a shell
+  await clock.advance(3_000)
+  expect(await headerOf(ui)).toContain('kept 1')
+
+  // And again: the poll goes on for as long as the pane is open.
+  const later = filed(w, file)
+  later.items[2]!.verdict = 'maybe'
+  save(w, file, later)
+  await clock.advance(3_000)
+  expect(await headerOf(ui)).toContain('maybe 1')
+})
+
+test('closing a curate pane drops its record from $.state and ends the polling; a record owing a stamp stays', async () => {
+  const timers: (() => void)[] = []
+  const { host, record } = stubHost(twoItems(), 'triage', { later: (_ms, fn) => void timers.push(fn) })
+  watchSet(host, 'k')
+  expect(timers).toHaveLength(1)
+  await closeSet(host, 'k')
+  expect(record()).toBeNull()
+  timers.shift()?.() // the poll that was waiting finds nothing to do and does not ask again
+  for (let i = 0; i < 5; i += 1) await Promise.resolve()
+  expect(timers).toHaveLength(0)
+
+  const owing = stubHost(twoItems())
+  await owing.host.updateSet('k', r => (r ? { ...r, stampPending: { via: 'submit', digest: 'd', retries: 0 } } : r))
+  await closeSet(owing.host, 'k')
+  expect(owing.record()?.stampPending).not.toBeNull() // the retries still need it
+})
+
+test('previews queued for a page that has been scrolled past do not run; those in flight finish', async ($, on) => {
+  const w = world(on)
+  const clock = mock.clock(on)
+  let release: () => void = () => undefined
+  w.gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const { ui } = await opened($, w, clock, { items: itemsOf(24) }, 140)
+  expect(previewRuns(w)).toHaveLength(4) // four in flight, the rest of page one queued
+  for (let i = 0; i < 23; i += 1) await ui.press({ key: HK('next') })
+  release()
+  await clock.settle()
+  const ran = previewRuns(w).map(r => r[1] ?? '')
+  // Page one's items 5 to 8 were queued and then left behind.
+  for (const n of [5, 6, 7, 8]) expect(ran).not.toContain(`/media/kick-${String(n).padStart(2, '0')}.wav`)
+  expect(ran).toContain('/media/kick-24.wav')
+})
+
+test('a rate set lists the items marked y after its ratings', async ($, on) => {
+  const w = world(on)
+  const clock = mock.clock(on)
+  const { file, ui } = await opened($, w, clock, { mode: 'rate' })
+  await ui.press({ key: HK('r4') })
+  await ui.press({ key: HK('keep') })
+  await ui.press({ key: HK('next') })
+  await ui.press({ key: HK('toss') })
+  await ui.press({ key: HK('done') })
+  expect(w.submits[0]?.text).toBe(
+    `Curated Kick candidates (rate): rated 1, kept 1, tossed 1, not reviewed 2. Rated: "kick-01" 4/5 "${picked(1)}". Kept: "kick-01" "${picked(1)}". Set file: "${file}"`,
+  )
 })

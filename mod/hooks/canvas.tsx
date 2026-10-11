@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
 import type { ActionButton, PaneRecord, PendingHandoff, Panel, View } from '../types'
-import { cli, clearPlaying, openSetFile, putSet, resumeStamps, setKeyOf, stopSet } from './curate'
+import { cli, clearPlaying, closeSet, openSetFile, putSet, resumeStamps, setKeyOf, stopSet, watchSet } from './curate'
 import type { Host } from './curate'
 import { PX_PER_COLUMN, SVG_ELEMENT_MAX, SVG_PAGE_BUDGET } from './layout'
 import { renderMediaPanel } from './media'
@@ -449,6 +449,7 @@ async function curateCall($: Dollar, input: unknown): Promise<{ result: string }
     if (!isOpen) await update($, curateKeys, keys => keys.filter(one => one !== key))
     return { deny: 'canvas curate: the pane could not be opened' }
   }
+  watchSet(host, key)
   const count = `${items.length} ${items.length === 1 ? 'item' : 'items'}`
   const head = isOpen
     ? `Focused ${title} (${count}), already open in a pane`
@@ -492,6 +493,8 @@ async function startCanvas($: Dollar): Promise<void> {
   for (const { view } of records) for (const panel of view.panels) if (panel.kind === 'media') mediaKeys.push(await setKeyOf(host, panel.set))
   const setKeys = [...(await read($, curateKeys)), ...mediaKeys]
   await clearPlaying(host, setKeys)
+  // ... and the polling of each open curate set's file.
+  for (const key of await read($, curateKeys)) watchSet(host, key)
   // ... and the retries of a hand-off stamp that could not be written, which died with the timers.
   await resumeStamps(host, setKeys)
 }
@@ -575,7 +578,7 @@ export function registerCanvas(on: On, options: PluginOptions): void {
     const out = await next(e)
     if (!('deny' in out) || out.deny === undefined) {
       const key = e.id.slice(CURATE_PREFIX.length)
-      stopSet(key)
+      await closeSet(mediaHost($), key)
       await update($, curateKeys, keys => keys.filter(one => one !== key))
     }
     return out
