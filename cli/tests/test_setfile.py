@@ -529,3 +529,27 @@ def test_show_on_a_non_set_fails_cleanly(tmp_path, capsys):
     capsys.readouterr()
     assert setfile.main(["show", path]) == 1
     assert "not a set file" in capsys.readouterr().err
+
+
+# --- vault-ylvpq: symlinked output and file mode --------------------------------------------------
+
+
+def test_new_force_through_a_symlink_writes_the_real_file_and_keeps_the_link(samples, tmp_path):
+    real = tmp_path / "real.curate.json"
+    assert new(["--title", "Old", "--mode", "triage", "-o", str(real), str(samples / "snare.wav")]) == 0
+    link = tmp_path / "link.curate.json"
+    link.symlink_to(real)
+    assert new(["--title", "New", "--mode", "triage", "-o", str(link), "--force", str(samples / "snare.wav")]) == 0
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert json.loads(real.read_text())["title"] == "New"
+
+
+def test_write_set_keeps_the_existing_file_mode(tmp_path):
+    path = tmp_path / "m.curate.json"
+    path.write_text("{}")
+    path.chmod(0o644)
+    setfile.write_set(str(path), {"a": 1})
+    assert (path.stat().st_mode & 0o7777) == 0o644
+    fresh = tmp_path / "fresh.curate.json"
+    setfile.write_set(str(fresh), {"a": 1})
+    assert (fresh.stat().st_mode & 0o7777) == 0o600

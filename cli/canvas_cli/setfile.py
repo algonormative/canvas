@@ -219,10 +219,19 @@ def write_set(path: str, data: dict, *, overwrite: bool = True) -> None:
     With ``overwrite=False`` the final step is a hard link, which fails if the
     destination exists, so two writers cannot silently clobber each other.
     """
+    if overwrite and os.path.islink(path):
+        # Replace the file the link points at, never the link itself.
+        path = os.path.realpath(path)
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
+    try:
+        mode: int | None = os.stat(path).st_mode & 0o7777
+    except OSError:
+        mode = None
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".curate.", suffix=".tmp")
     try:
+        if mode is not None:
+            os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
