@@ -3,3 +3,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 mod/.claude-plugin/types/
+demo/terminal-*.png
+demo/terminal.mp4

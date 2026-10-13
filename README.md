@@ -14,6 +14,10 @@ curating sets of media.
 |---|---|
 | <img src="docs/curate.png" alt="The curate pane: image thumbnails and audio waveforms with loudness, each with keep, toss and maybe buttons" width="380"> | <img src="docs/show.png" alt="A show pane: markdown, stat tiles, a table, an SVG bar chart and prompt buttons" width="380"> |
 
+In a terminal the same pane draws as text, with a card for each item; pictures and waveforms need the desktop app ([demo/demo.tape](demo/demo.tape), recorded with [VHS](https://github.com/charmbracelet/vhs)):
+
+<img src="demo/terminal.gif" alt="Terminal demo: Claude opens a curation set and the pane lists each item with keep, toss and maybe" width="760">
+
 - **`show` tool.** Claude opens a persistent, live-updating pane beside the chat and
   fills it with panels: markdown, stat tiles, tables, SVG pictures, a media set, and
   action buttons. Calling `show` again with the same pane id updates that pane in
