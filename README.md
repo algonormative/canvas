@@ -149,6 +149,25 @@ cd cli && uv run pytest
 Tests that need Quick Look skip where it cannot make thumbnails. The test suites never
 call a network service.
 
+### Re-record the demo
+
+`demo/demo.tape` records `demo/terminal.gif` with [VHS](https://github.com/charmbracelet/vhs) in your own logged-in `claude`. To keep your other plugins out of the recording, give it a settings file that turns every installed plugin off except this one:
+
+```bash
+python3 - > /tmp/canvas-demo-settings.json <<'EOF'
+import json, os
+s = json.load(open(os.path.expanduser("~/.claude/settings.json")))
+on = {n: n.split("@")[0] == "canvas" for n in s.get("enabledPlugins", {})}
+out = {"enabledPlugins": on, "theme": "dark", "statusLine": {"type": "command", "command": "true"}}
+print(json.dumps(out))
+EOF
+DEMO_SET="$(demo/setup.sh)" DEMO_SETTINGS=/tmp/canvas-demo-settings.json vhs demo/demo.tape
+```
+
+`demo/setup.sh` needs ffmpeg and `canvas-set` (see [Install the CLI](#install-the-cli)).
+
+The settings file only switches plugins for the recording; your own `settings.json` is untouched. Look through the GIF before you publish it: anything your session prints (paths, task titles) ends up in it.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
