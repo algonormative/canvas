@@ -23,8 +23,8 @@ jobs:
           fi
       - name: Validate and test
         run: |
-          claude plugin validate .
-          claude plugin validate mod
+          claude plugin validate --strict .
+          claude plugin validate --strict mod
           claude plugin test mod
       - name: Release notes from CHANGELOG.md
         run: |
