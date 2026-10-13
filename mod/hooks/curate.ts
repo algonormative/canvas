@@ -574,7 +574,7 @@ const sendAgain = (mode: string): string => (mode === 'pick-one' ? 'pick again' 
 /**
  * Tells Claude what was curated. The summary is read fresh from the file (never from state) and carries
  * a digest of the bytes it was made from; an empty prompt box takes it as a prompt, a draft gets it
- * appended and Nick sends; a box that will not take it leaves it for the next prompt to carry. Only then
+ * appended and the user sends; a box that will not take it leaves it for the next prompt to carry. Only then
  * is the hand-off stamped, with that digest: a file that changed while the text was on its way is refused
  * the stamp, and the changed set is summarised and sent once more (once: a second change asks the
  * person to press again). A stamp already there ends the matter: Done is refused, a second pick is only

@@ -460,7 +460,7 @@ test('curate opens a set in a focused pane and returns at once without echoing t
   mock.clock(on)
   await $.session.start(START)
   const out = await call($, { set: file })
-  expect(out).toEqual({ text: 'Opened Kick candidates (4 items) in a pane; the result arrives as a later prompt when Nick finishes.' })
+  expect(out).toEqual({ text: 'Opened Kick candidates (4 items) in a pane; the result arrives as a later prompt when the user finishes.' })
   expect(w.opens).toEqual([{ id: `curate-${keyOf(file)}`, title: 'Kick candidates', focus: true }])
   expect(JSON.stringify(out)).not.toMatch(/kick-0|\.wav/)
   expect(w.runs.some(r => r[1] === 'validate')).toBe(true)
@@ -1003,7 +1003,7 @@ test('pick-one sends the result on the pick that makes it, once', async ($, on) 
   expect(w.submits).toHaveLength(1)
   expect(await ui.find({ type: 'Button', key: HK('done') })).toBeUndefined()
 
-  // A different pick afterwards is only a file update: the pick moves, Nick is told to tell Claude.
+  // A different pick afterwards is only a file update: the pick moves, the user is told to tell Claude.
   await ui.press({ key: HK('next') })
   await ui.press({ key: HK('keep') })
   expect(verdictsOf(w, file)).toEqual([null, 'pick', null, null])
@@ -1204,7 +1204,7 @@ test('inline items are written into a set under ~/.cache/canvas/sets and opened'
   const out = await call($, { items: ['/media/a.wav', '/media/b.wav', 'https://example.com/c.png'], title: 'Kick candidates!', mode: 'pick-one' })
   const set = `${HOME}/.cache/canvas/sets/kick-candidates-20261010T162519Z.curate.json`
   expect(out).toEqual({
-    text: `Opened Kick candidates! (3 items) in a pane; the result arrives as a later prompt when Nick finishes. Set file: ${set}.`,
+    text: `Opened Kick candidates! (3 items) in a pane; the result arrives as a later prompt when the user finishes. Set file: ${set}.`,
   })
   expect(w.runs[0]).toEqual([
     'canvas-set', 'new', '--literal', '--title=Kick candidates!', '--mode=pick-one', '-o', set, '--',
@@ -1235,7 +1235,7 @@ test('a second curate of the same set refocuses its pane and keeps the place; an
   await ui.press({ key: HK('keep') })
 
   const again = await call($, { set: file })
-  expect(again).toEqual({ text: 'Focused Kick candidates (8 items), already open in a pane; the result arrives as a later prompt when Nick finishes.' })
+  expect(again).toEqual({ text: 'Focused Kick candidates (8 items), already open in a pane; the result arrives as a later prompt when the user finishes.' })
   expect(w.opens).toHaveLength(2)
   expect(new Set(w.opens.map(o => o.id)).size).toBe(1)
   expect(w.opens.every(o => o.focus === true)).toBe(true)
@@ -1611,7 +1611,7 @@ test('a reload of the module forgets the clip that was playing and the sets stop
   expect((await after.find({ type: 'Button', key: HK('play') }))?.props.label).toBe('play')
 })
 
-// ---- review fixes (vault-2lzfb) ------------------------------------------------------------------------
+// ---- review fixes ------------------------------------------------------------------------
 //
 // Each block below is one finding of the independent review, reproduced as a test that failed before the fix.
 
@@ -2286,7 +2286,7 @@ test('markdown from a file loses every way of asking for an image or HTML, neste
   }
 })
 
-// ---- vault-ylvpq: deferred review nits ---------------------------------------------------------------
+// ---- deferred review nits ---------------------------------------------------------------
 
 test('an open curate pane notices an edit made outside, without being drawn again', async ($, on) => {
   const w = world(on)

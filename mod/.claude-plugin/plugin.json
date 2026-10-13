@@ -3,8 +3,20 @@
   "version": "0.1.0",
   "description": "Persistent panes Claude opens on demand, and a media-curation panel for any set of files",
   "author": {
-    "name": "algonormative"
+    "name": "algonormative",
+    "url": "https://github.com/algonormative"
   },
+  "homepage": "https://github.com/algonormative/canvas",
+  "repository": "https://github.com/algonormative/canvas",
+  "license": "MIT",
+  "keywords": [
+    "canvas",
+    "panes",
+    "media",
+    "curation",
+    "audio",
+    "mod"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "commandsFile": {

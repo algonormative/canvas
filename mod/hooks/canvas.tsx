@@ -455,7 +455,7 @@ async function curateCall($: Dollar, input: unknown): Promise<{ result: string }
     ? `Focused ${title} (${count}), already open in a pane`
     : `Opened ${title} (${count}) in a pane`
   const where = isNew ? ` Set file: ${opened.record.path}.` : ''
-  return { result: `${head}; the result arrives as a later prompt when Nick finishes.${where}${drawn}` }
+  return { result: `${head}; the result arrives as a later prompt when the user finishes.${where}${drawn}` }
 }
 
 // ---- hooks ---------------------------------------------------------------------

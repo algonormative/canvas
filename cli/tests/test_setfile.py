@@ -531,7 +531,7 @@ def test_show_on_a_non_set_fails_cleanly(tmp_path, capsys):
     assert "not a set file" in capsys.readouterr().err
 
 
-# --- vault-ylvpq: symlinked output and file mode --------------------------------------------------
+# --- symlinked output and file mode --------------------------------------------------
 
 
 def test_new_force_through_a_symlink_writes_the_real_file_and_keeps_the_link(samples, tmp_path):

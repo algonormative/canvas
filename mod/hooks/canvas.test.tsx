@@ -299,11 +299,11 @@ test('svg wider than the pane is sized to the pane', async ($, on) => {
 test('run buttons resolve only through the allowlist', async ($, on) => {
   const w = world(on, {
     files: allow({
-      'plotter-check': { argv: ['npm', 'run', 'plotter-check'], cwd: '~/git/hatch3d' },
+      'build-check': { argv: ['npm', 'run', 'build-check'], cwd: '~/projects/demo' },
       shorthand: ['npm', 'run', 'x'],
       empty: { argv: [] },
     }),
-    exec: argv => (argv[2] === 'plotter-check' ? { exitCode: 0, stdout: 'SECRET-OUTPUT' } : { exitCode: 0 }),
+    exec: argv => (argv[2] === 'build-check' ? { exitCode: 0, stdout: 'SECRET-OUTPUT' } : { exitCode: 0 }),
   })
   mock.clock(on)
   await $.session.start(START)
@@ -313,7 +313,7 @@ test('run buttons resolve only through the allowlist', async ($, on) => {
       {
         kind: 'actions',
         buttons: [
-          { label: 'Re-check', run: 'plotter-check' },
+          { label: 'Re-check', run: 'build-check' },
           { label: 'Wipe', run: 'wipe-everything' },
           { label: 'Shorthand', run: 'shorthand' },
           { label: 'Empty', run: 'empty' },
@@ -338,7 +338,7 @@ test('run buttons resolve only through the allowlist', async ($, on) => {
 
   const ui = await draw($, 'desktop', 'acts')
   await ui.press({ key: 'a0-0' })
-  expect(w.runs).toEqual([{ argv: ['npm', 'run', 'plotter-check'], cwd: `${HOME}/git/hatch3d`, timeoutMs: 120_000 }])
+  expect(w.runs).toEqual([{ argv: ['npm', 'run', 'build-check'], cwd: `${HOME}/projects/demo`, timeoutMs: 120_000 }])
   expect(w.toasts).toEqual(['Re-check: done'])
 
   w.exec = () => ({ exitCode: 2, stdout: 'SECRET-OUTPUT' })

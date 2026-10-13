@@ -1,0 +1,30 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  mod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate the marketplace
+        run: claude plugin validate .
+      - name: Validate the mod
+        run: claude plugin validate mod
+      - name: Run the mod's tests
+        run: claude plugin test mod
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install media tools (the tests generate fixtures with them)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg sox
+      - name: Run the CLI's tests
+        run: cd cli && uv run pytest

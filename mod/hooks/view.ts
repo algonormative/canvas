@@ -6,7 +6,7 @@ import type { ActionButton, Panel, Refresh, View } from '../types'
 
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string }
 
-/** The command allowlist: name -> argv (+ cwd). Owned by Nick, never written by the mod. */
+/** The command allowlist: name -> argv (+ cwd). Owned by the user, never written by the mod. */
 export type CommandEntry = { argv: string[]; cwd?: string }
 
 export type Patch = { index: number; panel: Panel }
