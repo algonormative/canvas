@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- README: screenshots and badges.
+- `demo/setup.sh`: generates demo sounds, images and a curation set.
+
 ## 0.1.0
 
 First public release.

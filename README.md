@@ -1,7 +1,18 @@
 # canvas
 
+[![ci](https://github.com/algonormative/canvas/actions/workflows/ci.yml/badge.svg)](https://github.com/algonormative/canvas/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/algonormative/canvas?color=blue)](https://github.com/algonormative/canvas/releases/latest)
+[![license](https://img.shields.io/github/license/algonormative/canvas)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white)](#install)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-%E2%89%A52.1.295-D97757)](https://code.claude.com/docs/en/plugins/mods/overview)
+[![surfaces](https://img.shields.io/badge/surfaces-desktop%20%C2%B7%20terminal-555)](#install)
+
 A Claude Code mod that gives Claude panes it can draw on demand, and a panel for
 curating sets of media.
+
+| `curate`: a set of sounds and images to triage | `show`: a pane Claude drew |
+|---|---|
+| <img src="docs/curate.png" alt="The curate pane: image thumbnails and audio waveforms with loudness, each with keep, toss and maybe buttons" width="380"> | <img src="docs/show.png" alt="A show pane: markdown, stat tiles, a table, an SVG bar chart and prompt buttons" width="380"> |
 
 - **`show` tool.** Claude opens a persistent, live-updating pane beside the chat and
   fills it with panels: markdown, stat tiles, tables, SVG pictures, a media set, and
